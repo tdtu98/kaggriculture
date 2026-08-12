@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "kagsim"
+dynamic = ["version"]
+requires-python = ">=3.13"
+description = "Fast Kaggriculture simulator (Rust core, PyO3 bindings)"
+classifiers = ["Programming Language :: Rust"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]

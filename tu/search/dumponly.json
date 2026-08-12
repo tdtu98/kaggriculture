@@ -1,0 +1,156 @@
+{
+  "params": {
+    "cash_floor": 246.24781666599202,
+    "land_min_cash": 4143.956682128972,
+    "goose_min_cash": 1370.763002690789,
+    "seed_budget_frac": 0.4634187536424392,
+    "buy_land": false,
+    "land_fill_frac": 0.781786028416179,
+    "hire_max": 7,
+    "tiles_per_unit": 13.02073904292078,
+    "crop_mix": {
+      "WHEAT": 0.016279148396674232,
+      "CARROT": 0.6510526097211369,
+      "TOMATO": 0.06667924721234639,
+      "STRAWBERRY": 0.3284693572974547,
+      "MELON": 0.7611197845391493
+    },
+    "melon_stagger": 0,
+    "goose_target": 0,
+    "care": true,
+    "feed_alternate": false,
+    "wheat_reserve_per_animal": 2,
+    "reserve_frac": {
+      "WHEAT": 0.0,
+      "CARROT": 0.0,
+      "TOMATO": 0.0,
+      "STRAWBERRY": 0.0,
+      "MELON": 0.0,
+      "EGG": 0.0,
+      "MILK": 0.0,
+      "WOOL": 0.0,
+      "FERTILIZER": 0.0
+    },
+    "sell_all_after_day": 29,
+    "forecast_weight": 0.0,
+    "forecast_horizon": 13,
+    "harvest_early": false
+  },
+  "vector": [
+    0.016279148396674232,
+    0.6510526097211369,
+    0.06667924721234639,
+    0.3284693572974547,
+    0.7611197845391493,
+    0.0,
+    0.781786028416179,
+    4143.956682128972,
+    7.0,
+    13.02073904292078,
+    0.0,
+    1.0,
+    0.0,
+    1.8,
+    1370.763002690789,
+    246.24781666599202,
+    0.4634187536424392,
+    0.0,
+    12.6,
+    29.4,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "history": [
+    {
+      "gen": 0,
+      "train_best": 6089.722222222223,
+      "train_winrate": 0.7777777777777778,
+      "val_margin": 4804.0625,
+      "val_winrate": 0.8333333333333334
+    },
+    {
+      "gen": 1,
+      "train_best": 13946.111111111111,
+      "train_winrate": 1.0,
+      "val_margin": -4481.479166666667,
+      "val_winrate": 0.3333333333333333
+    },
+    {
+      "gen": 2,
+      "train_best": 20841.083333333332,
+      "train_winrate": 1.0,
+      "val_margin": 12391.625,
+      "val_winrate": 1.0
+    },
+    {
+      "gen": 3,
+      "train_best": 13511.611111111111,
+      "train_winrate": 1.0,
+      "val_margin": 3410.8541666666665,
+      "val_winrate": 0.375
+    },
+    {
+      "gen": 4,
+      "train_best": 10572.833333333334,
+      "train_winrate": 1.0,
+      "val_margin": 1943.7708333333333,
+      "val_winrate": 0.3333333333333333
+    },
+    {
+      "gen": 5,
+      "train_best": 17464.972222222223,
+      "train_winrate": 1.0,
+      "val_margin": 10049.479166666666,
+      "val_winrate": 0.9166666666666666
+    },
+    {
+      "gen": 6,
+      "train_best": 11168.5,
+      "train_winrate": 1.0,
+      "val_margin": 12139.729166666666,
+      "val_winrate": 1.0
+    },
+    {
+      "gen": 7,
+      "train_best": 12107.055555555555,
+      "train_winrate": 0.888888888888889,
+      "val_margin": 11944.875,
+      "val_winrate": 0.875
+    },
+    {
+      "gen": 8,
+      "train_best": 15684.111111111111,
+      "train_winrate": 1.0,
+      "val_margin": 11639.104166666666,
+      "val_winrate": 0.9166666666666666
+    },
+    {
+      "gen": 9,
+      "train_best": 16188.777777777776,
+      "train_winrate": 1.0,
+      "val_margin": 12625.916666666666,
+      "val_winrate": 0.9166666666666666
+    },
+    {
+      "gen": 10,
+      "train_best": 11976.833333333334,
+      "train_winrate": 1.0,
+      "val_margin": 12894.479166666666,
+      "val_winrate": 0.9166666666666666
+    },
+    {
+      "gen": 11,
+      "train_best": 12979.97222222222,
+      "train_winrate": 0.888888888888889,
+      "val_margin": 11103.3125,
+      "val_winrate": 0.7916666666666666
+    }
+  ]
+}
