@@ -1,0 +1,155 @@
+{
+  "metadata": {
+    "agent_a": {
+      "builtin": false,
+      "identifier": "another_work/01_baseline3k/main.py",
+      "label": "01_baseline3k",
+      "resolved_path": "/Users/minhduy/Desktop/Project/kaggle/kaggriculture/duy/another_work/01_baseline3k/main.py",
+      "sha256": "f029fa0cb66a9eb509afbe44e3f59b800332d0419db91607183410e4089c4d19"
+    },
+    "agent_b": {
+      "builtin": false,
+      "identifier": "another_work/00_baseline/main.py",
+      "label": "00_baseline",
+      "resolved_path": "/Users/minhduy/Desktop/Project/kaggle/kaggriculture/duy/another_work/00_baseline/main.py",
+      "sha256": "3c9b6e75d1bb9cc1f23b6bf5d8821c84193d1306d5bcb74ada1628359e3fb025"
+    },
+    "created_at_utc": "2026-08-13T06:28:07.344519+00:00",
+    "games": 100,
+    "kaggle_environments_version": "1.32.6",
+    "protocol_version": 1,
+    "python_version": "3.12.9",
+    "seed_count": 50,
+    "seed_start": 0,
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49
+    ],
+    "steps": 720
+  },
+  "summary": {
+    "agent_a_money": {
+      "maximum": 152551.0,
+      "mean": 92296.01,
+      "median": 92061.0,
+      "minimum": 47996.0
+    },
+    "agent_b_money": {
+      "maximum": 130477.0,
+      "mean": 75123.93,
+      "median": 75017.0,
+      "minimum": 38455.0
+    },
+    "by_agent_a_seat": {
+      "0": {
+        "agent_a_money": {
+          "maximum": 149606.0,
+          "mean": 91937.42,
+          "median": 91523.5,
+          "minimum": 47996.0
+        },
+        "agent_b_money": {
+          "maximum": 126623.0,
+          "mean": 74785.8,
+          "median": 74576.0,
+          "minimum": 38455.0
+        },
+        "games": 50,
+        "losses": 0,
+        "margin": {
+          "maximum": 27093.0,
+          "mean": 17151.62,
+          "median": 17069.5,
+          "minimum": 8890.0
+        },
+        "ties": 0,
+        "win_rate": 1.0,
+        "wins": 50
+      },
+      "1": {
+        "agent_a_money": {
+          "maximum": 152551.0,
+          "mean": 92654.6,
+          "median": 92220.0,
+          "minimum": 49432.0
+        },
+        "agent_b_money": {
+          "maximum": 130477.0,
+          "mean": 75462.06,
+          "median": 75500.5,
+          "minimum": 39434.0
+        },
+        "games": 50,
+        "losses": 0,
+        "margin": {
+          "maximum": 27093.0,
+          "mean": 17192.54,
+          "median": 16890.0,
+          "minimum": 8860.0
+        },
+        "ties": 0,
+        "win_rate": 1.0,
+        "wins": 50
+      }
+    },
+    "games": 100,
+    "losses": 0,
+    "margin": {
+      "maximum": 27093.0,
+      "mean": 17172.08,
+      "median": 17068.5,
+      "minimum": 8860.0
+    },
+    "ties": 0,
+    "win_rate": 1.0,
+    "wins": 100
+  }
+}
