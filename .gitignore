@@ -33,3 +33,16 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+# --- Project-local artifacts ---
+.env
+.env.*
+!.env.example
+.superpowers/
+.worktrees/
+*.log
+logs/
+traces/
+replays/
+replay.html
+sample_observation.json

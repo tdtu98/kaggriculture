@@ -1,0 +1,11 @@
+Agent A: 00_baseline
+Agent B: tu
+Seeds: 0..49
+Games: 100
+Outcomes: 100 wins / 0 losses / 0 ties
+Win rate: 100.00%
+Agent A money: mean=116576.30 median=115848.00 min=47305.00 max=174731.00
+Agent B money: mean=32992.58 median=26998.50 min=35.00 max=83637.00
+Margin: mean=83583.72 median=88230.00 min=22253.00 max=139635.00
+Agent A in seat 0: games=50 win_rate=100.00% mean_margin=83583.72
+Agent A in seat 1: games=50 win_rate=100.00% mean_margin=83583.72
