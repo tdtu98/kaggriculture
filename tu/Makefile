@@ -1,5 +1,9 @@
-PY  := /opt/miniconda3/bin/python
-PIP := /opt/miniconda3/bin/pip
+# The env lives in this repo's own venv, not the shared miniconda: PLAN_v4 needs
+# kaggle-environments 1.32.7 (hinge prices) while ../kaggriculture stays pinned to 1.32.6, and
+# both import the same `kagsim` name. `make setup` builds it from scratch.
+VENV := $(CURDIR)/.venv
+PY   := $(VENV)/bin/python
+PIP  := $(VENV)/bin/pip
 CARGO_ENV := . "$$HOME/.cargo/env";
 
 .PHONY: help setup sim test test-rust test-py bench clean
@@ -7,12 +11,13 @@ CARGO_ENV := . "$$HOME/.cargo/env";
 help:
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  %-12s %s\n", $$1, $$2}'
 
-setup:  ## Install toolchain (rust, maturin, pytest)
+setup:  ## Create .venv (env 1.32.7) and install the toolchain (rust, maturin, pytest)
 	@command -v rustc >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
-	$(PIP) install -q maturin pytest pytest-xdist
+	@test -x $(PY) || /opt/miniconda3/bin/python -m venv $(VENV)
+	$(PIP) install -q "kaggle-environments==1.32.7" maturin pytest pytest-xdist numpy scipy cma
 
-sim:  ## Build the Rust simulator into the miniconda env
-	$(CARGO_ENV) cd kagsim && CONDA_PREFIX=/opt/miniconda3 /opt/miniconda3/bin/maturin develop --release
+sim:  ## Build the Rust simulator into .venv
+	$(CARGO_ENV) cd kagsim && VIRTUAL_ENV=$(VENV) $(VENV)/bin/maturin develop --release
 
 test-rust:  ## cargo unit tests (rule-level invariants)
 	$(CARGO_ENV) cd kagsim && cargo test --lib

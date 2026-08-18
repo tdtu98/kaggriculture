@@ -99,6 +99,12 @@ KNOBS: list[Knob] = [
     Knob("plant_rate_per_day", 0.0, 16.0, "int"),
     Knob("plant_stop_late", 0.0, 1.0, "bool"),
     Knob("adaptive_mix", 0.0, 1.0, "bool"),
+    # E46. **Safe range is ~1.0-2.0**: at 2.5 and above the penalty exceeds any plausible distance
+    # saving, so a unit whose role has no work refuses to help and falls through to hauling --
+    # winrate goes 62% -> 4% between 2.0 and 2.5. A knob missing from this list is one the search
+    # cannot reach *and* one that `decode(encode(p))` silently drops, which broke champion
+    # self-play the moment role_penalty entered champion.json.
+    Knob("role_penalty", 0.0, 2.5),
     # Upper bound cut 3000 -> 800 (E12). `goose_target` only has an effect when `goose_min_cash`
     # is small enough for a goose to ever be bought, so a high value silently *disables* the whole
     # livestock line. CEM samples each dimension independently around the mean, which makes a

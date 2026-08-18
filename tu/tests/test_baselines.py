@@ -46,7 +46,12 @@ def test_starter_hits_the_documented_baseline():
     # unlocks draw with replacement (E33). The value is pinned to catch drift, not because the
     # number means anything; `test_closed_loop_matches_reference` above is the real check, and it
     # compares kagsim against whatever the installed reference does.
-    assert kagsim_money("starter", 7) == [3488.0, 3488.0]
+    #
+    # 3488 -> 3507 at 1.32.7 (carrot's below-I0 curve went `log`/0.2 -> `hinge`/1.0). starter is a
+    # carrot loop and the town drains carrot to 9,808 on this seed -- 0.43T below I0, still under
+    # the hinge's knee, so this is the shape's *linear* region repricing carrot ~$41 -> ~$50, not
+    # the scarcity spike. Traced, not assumed: min inventory printed per product on seed 7.
+    assert kagsim_money("starter", 7) == [3507.0, 3507.0]
     assert kagsim_money("pass", 7) == [3000.0, 3000.0]
 
 

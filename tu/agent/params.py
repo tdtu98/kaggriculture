@@ -124,6 +124,12 @@ class Params:
     # boatlee's units are 93% role-pure; ours switch on 33% of consecutive actions, and pastures
     # and fields are in different places, so each switch is a crossing (E46).
     role_penalty: float = 0.0
+    # Discount, in tiles, for work on the tile a unit already occupies. 0 is off. Finishing a tile
+    # before moving is what lets boatlee issue 46% of its actions without moving, against our 28%.
+    here_bonus: float = 0.0
+    # Finish the tile you are standing on before moving. Runs ahead of sticky assignment and of
+    # other units' claims, both of which pre-empt a mere cost discount (E47).
+    finish_tile: bool = False
     # Subtract pickups already en route when sizing a fetch. Measured worse on its own (E29);
     # searchable because the hauling waste it targets is real (35% of our productive turns).
     fetch_in_flight: bool = False

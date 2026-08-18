@@ -41,6 +41,26 @@ class AgentSpec:
             from agent import Params, make_agent
 
             return make_agent(Params(**self.params))
+        if self.kind == "relay":
+            # PLAN3 R0. `overlays` names functions in `agent.relay`; empty means the reference
+            # agent's own stack, which is bit-identical to `boatlee` (tests/test_relay_parity.py).
+            from agent import relay
+
+            names = self.params.get("overlays")
+            if names is None:
+                return relay.make_relay()
+            # Thresholds live in the spec, not as module constants, so `tools/promote.py` stage 3
+            # can sweep them. E53: the gate reported PASS on a neighbourhood check it never ran,
+            # because a relay agent exposed no knobs it could see.
+            built = []
+            for n in names:
+                if n == "surplus_release":
+                    built.append(relay.make_surplus_release(
+                        pressure=self.params.get("release_pressure", relay.RELEASE_PRESSURE),
+                        batch=self.params.get("release_batch", relay.RELEASE_BATCH)))
+                else:
+                    built.append(getattr(relay, n))
+            return relay.make_relay(overlays=tuple(built))
         if self.kind == "external":
             # An agent nobody here wrote. D16 says every other number in this project is
             # self-referential -- 77 agents from one author, reproducing one author's blind spots.
@@ -287,6 +307,21 @@ _variant("stop-late", "no plantings that cannot mature before the season ends",
          plant_stop_late=True)
 
 
+# E46: unit role specialisation. boatlee keeps its units 93% role-pure; ours switch between crop
+# and animal work on 33% of consecutive actions, and the two happen in different parts of the farm.
+_variant("role3", "champion + role specialisation (penalty 3, past the cliff)", role_penalty=3.0)
+_variant("role2", "champion + role specialisation (penalty 2)", role_penalty=2.0)
+_variant("role1.5", "champion + role specialisation (penalty 1.5)", role_penalty=1.5)
+# Stage 3 of role1.5's gate, and independently the champion's own audit, both name cow_target=5.
+_variant("role1.5-cow5", "role specialisation + the neighbour both gates pointed at",
+         role_penalty=1.5, cow_target=5)
+
+
+# E47: finish the tile you stand on before moving. Mechanism verified (walk-aways 829 -> 373,
+# same-tile 29% -> 35%); kept registered so the trace comparison is reproducible.
+_variant("finish-tile", "champion + finish the tile you are standing on", finish_tile=True)
+
+
 # Land, re-tested. The farm is now 25/25 full with the herd at target, and every "land loses"
 # measurement (E1, E6, E14) was taken under a melon strategy with 8 hands, bad routing and few
 # animals. A conclusion is only valid for the strategy it was measured on — that has now bitten
@@ -304,6 +339,55 @@ _variant("land-d", "buy land late (big reserve), big herd", buy_land=True, land_
 # V2: opponents written from a design brief, not by mutating champion parameters.
 for _name in ("o-goose-baron", "o-shop-chaser", "o-land-baron", "o-sprinter"):
     REGISTRY[_name] = AgentSpec("designed", {"name": _name}, "independently designed (V2)")
+
+
+# PLAN3 R0.3: the relay line. `relay-base` is the reference agent's 719-step table plus its own five
+# overlays, restructured into `agent/relay.py` so behaviour can be added without touching
+# `reference/kaggriculture/1/submission.py` -- the arena's only external opponent and the only
+# non-self-referential measurement in the project (D16).
+#
+# It is **bit-identical** to `boatlee`, proven step-by-step over 20 seeds x 2 seats by
+# `tests/test_relay_parity.py`, not asserted here. Every later variant is this entry plus one named
+# overlay, so an A/B isolates the overlay and nothing else -- which is the whole reason the fixed
+# table is a better experimental substrate than our own engine (E48).
+REGISTRY["relay-base"] = AgentSpec(
+    kind="relay", params={},
+    note="PLAN3 R0: reference table + its own overlays; bit-identical to boatlee")
+
+# PLAN3 R1. Same table, same logistics, but the herd is chosen from the shops this game drew
+# instead of committed before any shop unlocks. Purchase, shed pickup and placement are resolved
+# against the stock actually held, because rewriting the purchase alone strands the animal and
+# costs the whole farm (E50: 1,667 blocked ops, $689).
+REGISTRY["relay-herd"] = AgentSpec(
+    kind="relay",
+    params={"overlays": ["weed_repair", "adaptive_livestock", "wool_controller",
+                         "rank_sell_slots", "market_relay"]},
+    note="PLAN3 R1: COW/SHEEP chosen from observed shop demand")
+
+# PLAN3 R1, restricted to the cheaper swap direction (SHEEP -> COW). Separates "the idea is wrong"
+# from "the implementation strands animals": this direction always settles if the scripted purchase
+# would have, so a loss here refutes the hypothesis rather than the code.
+REGISTRY["relay-herd-down"] = AgentSpec(
+    kind="relay",
+    params={"overlays": ["weed_repair", "adaptive_livestock_downgrade", "wool_controller",
+                         "rank_sell_slots", "market_relay"]},
+    note="PLAN3 R1: drop sheep when no yarn store; cheaper direction only")
+
+# PLAN3 R2e. The sell half alone -- on an unmodified table there is no surplus, so this is close to
+# a no-op by construction. That is its null test (E50: relay-base strands 0.1 items/season).
+REGISTRY["relay-sell"] = AgentSpec(
+    kind="relay",
+    params={"overlays": ["weed_repair", "convert_livestock", "wool_controller",
+                         "surplus_release", "rank_sell_slots", "market_relay"],
+            "release_pressure": 70, "release_batch": 8},
+    note="PLAN3 R2e: release stock the remaining script will never sell")
+
+# PLAN3 R2e proper: production and sales changed together. Neither half pays alone (PLAN3 SS2).
+REGISTRY["relay-paired"] = AgentSpec(
+    kind="relay",
+    params={"overlays": ["weed_repair", "adaptive_livestock_downgrade", "wool_controller",
+                         "surplus_release", "rank_sell_slots", "market_relay"]},
+    note="PLAN3 R2e: adaptive herd PLUS a sell schedule that can follow it")
 
 
 def resolve(names: list[str]) -> dict[str, AgentSpec]:

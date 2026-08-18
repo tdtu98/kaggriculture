@@ -21,6 +21,8 @@ CONTENTS = [
     "agent/__init__.py",
     "agent/engine.py",
     "agent/forward.py",
+    "agent/relay.py",
+    "agent/relay_table.py",
     "agent/params.py",
     "search/champion.json",
 ]

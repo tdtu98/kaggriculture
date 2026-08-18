@@ -12,6 +12,8 @@ If either flips, the strategy needs rethinking rather than retuning, so they get
 
 from __future__ import annotations
 
+import statistics
+
 import pytest
 
 import kagsim
@@ -115,15 +117,31 @@ def test_holding_inventory_loses_when_the_reserve_actually_binds(reserve):
     hold = dict(base)
     hold["reserve_frac"] = {**{k: 0.0 for k in hold["reserve_frac"]},
                             **{k: reserve for k in SHOP_DEMANDED}}
-    sell_now, _ = _run(Params(**base), seed=4)
-    holding, _ = _run(Params(**hold), seed=4)
 
-    if sell_now.money(0) == holding.money(0):
+    # Averaged over seeds, not measured on one. The single-seed version of this test raised a
+    # false alarm the moment the champion changed by two knobs (E46): it reported "E16 has
+    # reversed" at $65,825 vs $64,295, while the same comparison over 12 seeds had holding losing
+    # by a wide margin at every reserve level. A directional claim needs more than one sample.
+    seeds = list(range(4, 24))
+    diffs = []
+    for sd in seeds:
+        a, _ = _run(Params(**base), seed=sd)
+        b, _ = _run(Params(**hold), seed=sd)
+        diffs.append(b.money(0) - a.money(0))
+
+    if all(d == 0 for d in diffs):
         pytest.skip(f"reserve at {reserve}x base never binds — prices stay above it all season, "
                     "so this comparison is vacuous (itself a confirmation of the scarcity regime)")
-    assert sell_now.money(0) > holding.money(0), (
-        f"holding at {reserve}x base earned ${holding.money(0):,.0f} vs "
-        f"${sell_now.money(0):,.0f} — E16 has reversed"
+
+    mean = statistics.mean(diffs)
+    se = statistics.pstdev(diffs) / len(diffs) ** 0.5
+    if abs(mean) < 2 * se:
+        pytest.skip(f"reserve at {reserve}x base moves money by ${mean:,.0f} +/- ${se:,.0f} -- "
+                    "within noise, so there is no direction to assert. Measured at 50 seeds: "
+                    "0.9x is -$289 +/- $530 (noise), 1.3x is -$24,807 +/- $1,985 (real).")
+    assert mean < 0, (
+        f"holding at {reserve}x base earned ${mean:,.0f} MORE than selling, over {len(seeds)} "
+        f"seeds (SE ${se:,.0f}) — E16 has reversed"
     )
 
 
@@ -134,16 +152,24 @@ def test_at_least_one_reserve_level_binds():
     "holding loses" would be unsupported rather than confirmed.
     """
     base = dict(REGISTRY["champion"].params)
-    sell_now, _ = _run(Params(**base), seed=4)
+    seeds = range(4, 16)
     for reserve in (1.1, 1.3, 1.6):
         hold = dict(base)
         hold["reserve_frac"] = {**{k: 0.0 for k in hold["reserve_frac"]},
                                 **{k: reserve for k in SHOP_DEMANDED}}
-        holding, _ = _run(Params(**hold), seed=4)
-        if holding.money(0) != sell_now.money(0):
-            assert holding.money(0) < sell_now.money(0), (
-                f"reserve {reserve}x base *helped* (${holding.money(0):,.0f} vs "
-                f"${sell_now.money(0):,.0f}) — E16/D18 need revisiting"
+        sell_tot = hold_tot = 0.0
+        changed = False
+        for sd in seeds:
+            a, _ = _run(Params(**base), seed=sd)
+            b, _ = _run(Params(**hold), seed=sd)
+            sell_tot += a.money(0)
+            hold_tot += b.money(0)
+            changed |= a.money(0) != b.money(0)
+        if changed and abs(hold_tot - sell_tot) > 0.02 * sell_tot:
+            n = len(list(seeds))
+            assert hold_tot < sell_tot, (
+                f"reserve {reserve}x base *helped* (${hold_tot/n:,.0f} vs ${sell_tot/n:,.0f} over "
+                f"{n} seeds) — E16/D18 need revisiting"
             )
             return
     pytest.fail("no reserve level up to 1.6x base changed behaviour; the holding tests are vacuous")

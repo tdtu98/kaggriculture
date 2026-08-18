@@ -26,14 +26,23 @@ import pytest
 # Verified state: 100% of simulation lines differentially covered, 0 divergences, and bit-exact
 # against a third-party agent on money, action counts and routing metrics (E27, E28).
 #
-# History -- this guard has fired once, in anger, and it worked:
+# History -- this guard has fired twice, in anger, and it worked both times:
 #   1.32.4 -> 1.32.6 (E33). Kaggle cut town-centre demand ~4.7x, made shop unlocks draw WITH
 #   replacement (so a product can have zero shops or four), and moved the shed operations ahead of
 #   the LOCKED guard. kagsim was updated for all three and re-verified before this pin was moved.
-PINNED_VERSION = "1.32.6"
+#
+#   1.32.6 -> 1.32.7 (PLAN_v4). The *only* change is the market curve, and it is a large one:
+#   `_shape` gained a `hinge` function (`HINGE_GAIN = 8`, scaled so f(T) == 1) and CARROT, TOMATO
+#   and EGG switched to it below I0 -- carrot's below_target moving 0.2 -> 1.0 with it. Below -T
+#   those three now run away quadratically (tomato $300 at -2T against $84 at -T), which is the
+#   whole basis of PLAN_v4 2.7. Every simulation rule outside `_shape`/`market_price` is
+#   byte-identical: `diff` of the two sources touches nothing else. kagsim's `Shape::Hinge` and
+#   `agent/relay.py`'s vendored copy were both ported, and `make verify` re-run to 0 divergences,
+#   before this pin was moved.
+PINNED_VERSION = "1.32.7"
 PINNED_SHA256 = {
-    "kaggriculture.py": "fb9215c5e21a2524",
-    "kaggriculture.json": "7f196f4aaf9b4e48",
+    "kaggriculture.py": "bc8a54879ef02c7e",
+    "kaggriculture.json": "a82c89c1a2315b93",
 }
 
 _ENV_DIR = os.path.join(os.path.dirname(kaggle_environments.__file__), "envs", "kaggriculture")

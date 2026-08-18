@@ -38,6 +38,9 @@ BUILD_OP = {"COOP": "BUILD_COOP", "PASTURE": "BUILD_PASTURE"}
 # Livestock work happens on pastures and coops; crop work happens on the fields. They are in
 # different places, so a unit that alternates between them pays the walk every time it switches.
 ANIMAL_OPS = frozenset({"FEED", "CARE", "COLLECT_FERTILIZER", "PLACE"})
+# Shed logistics rather than farm work. Always available at the shed, so any "stay put" rule that
+# accepts them turns into camping.
+HAUL_OPS = frozenset({"PICKUP", "DROP"})
 
 
 _INF = float("inf")
@@ -172,6 +175,9 @@ class Engine:
         self._assigned: dict[int, tuple[int, int, str, str | None, int | None]] = {}
         self._demand: dict[str, int] | None = None
         self._last_plan: dict[int, int] = {}
+        self._n_animals = 0
+        self._n_plants = 0
+        self._deferred: dict[int, tuple] = {}
         self._role_cache: list[str] = []
         self._role_key: tuple | None = None
 
@@ -268,6 +274,8 @@ class Engine:
                         tasks.append(Task(x, y, "CARE", None, 4))
                 else:  # an empty structure — kind decides which species can go on it
                     empty_coops_by_kind[t.get("kind", "COOP")].append((x, y))
+
+        self._n_animals, self._n_plants = n_animals, n_plants
 
         # Wheat fetching. Without this, FEED is permanently unassignable (`needs="WHEAT"` and no
         # unit ever carries any), so every animal placed starves within two days.
@@ -447,13 +455,36 @@ class Engine:
         # day and re-derived only when the day turns or the roster size changes.
         key = (self._day, len(units))
         if self._role_key != key:
-            n_animal = sum(1 for t in tasks if t.op in ANIMAL_OPS)
-            share = n_animal / len(tasks) if tasks else 0.0
+            # Split by what the FARM is made of, not by the momentary task list. The task list is
+            # violently uneven within a day -- at dawn it is almost entirely "feed everything", so
+            # sizing the livestock crew from it locks most of the roster onto animal work that is
+            # finished by mid-morning, after which they are barred from the fields and idle. Tile
+            # counts are stable and are what the work will average out to.
+            n_animal = self._n_animals
+            total = n_animal + self._n_plants
+            share = n_animal / total if total else 0.0
             k = min(len(units), max(0, round(share * len(units))))
             # Low indices take livestock: the farmer and earliest hands are the longest-lived.
             self._role_cache = ["A"] * k + ["C"] * (len(units) - k)
             self._role_key = key
         return self._role_cache
+
+    @staticmethod
+    def _here_bonus(unit, task: Task, bonus: float) -> float:
+        """Discount for work on the tile a unit already stands on.
+
+        Without it, priority arithmetic drives units off tiles that still have work. With
+        `priority_weight = 0.49`, a CARE (priority 4) **on the current tile** costs 0 + 0.49*4 =
+        1.96, while a WATER (priority 0) **one step away** costs 1.00 -- so the unit walks. Measured
+        consequence: 27% of all moves leave a tile with a pending task, dominated by CARE (569),
+        COLLECT_FERTILIZER (348) and FEED (311).
+
+        boatlee issues 46% of its actions without having moved, running FEED -> CARE ->
+        COLLECT_FERTILIZER -> HARVEST in a single visit; we manage 28% (E47).
+        """
+        if not bonus:
+            return 0.0
+        return -bonus if (unit[0] == task.x and unit[1] == task.y) else 0.0
 
     @staticmethod
     def _role_cost(role: str, task: Task, penalty: float) -> float:
@@ -479,14 +510,58 @@ class Engine:
         actions: list[list] = []
         p_weight = self.p.priority_weight
         rp = self.p.role_penalty
+        hb = self.p.here_bonus
         roles = self._roles(units, tasks) if rp else ["C"] * len(units)
         taken: set[int] = set()
         by_key = {(t.x, t.y, t.op, t.arg, t.n): ti for ti, t in enumerate(tasks)}
 
-        # Honour existing assignments first so units actually finish the walk they started.
         keep: dict[int, int] = {}
+
+        # FIRST: a unit standing on work it can do, does it.
+        #
+        # This has to run before everything else, because everything else pre-empts it. Measured
+        # (E47): units walk away from eligible work on their own tile 829 times a season -- 419
+        # because a sticky assignment made on an earlier turn is honoured before the cost function
+        # is consulted at all, and 381 because another unit (often further away) claimed the task
+        # first. A distance-zero discount in the cost function cannot fix either: it was consulted
+        # in 4% of those cases.
+        #
+        # boatlee issues 46% of its actions without moving, chaining FEED -> CARE ->
+        # COLLECT_FERTILIZER on one visit; we manage 28% while having *more* co-located work
+        # available (41% of our actions have another task pending on the same tile, against their
+        # 30%).
+        if self.p.finish_tile:
+            for idx, (ux, uy) in enumerate(units):
+                inv = invs[idx] if idx < len(invs) else {}
+                for j, t in enumerate(tasks):
+                    if j in taken or (t.x, t.y) != (ux, uy):
+                        continue
+                    # Farm work only. The first version accepted any task, and the tile a unit has
+                    # most often "not finished" is the **shed**, which always has another PICKUP
+                    # waiting -- so units camped there. Measured: PICKUP +52%, hauling 7.3% -> 9.7%,
+                    # movement *up* 52.8% -> 55.8%, and of the 142 extra same-tile actions it
+                    # produced, 117 were shed shuffling and farm work actually fell (E47).
+                    if t.op in HAUL_OPS:
+                        continue
+                    if t.needs and inv.get(t.needs, 0) <= 0:
+                        continue
+                    keep[idx] = j
+                    taken.add(j)
+                    break
+
+        # Honour existing assignments so units actually finish the walk they started.
         for idx in range(len(units)):
-            prev = self._assigned.get(idx)
+            if idx in keep:
+                # Local work is a *detour*, not a change of plan. The first version popped the
+                # sticky target here, so a unit three tiles into a five-tile walk that paused to do
+                # something underfoot forgot where it was going and re-decided from scratch next
+                # turn. That restarted journeys instead of shortening them -- movement rose
+                # 52.7% -> 55.0% and hauling 7.7% -> 9.4%, the opposite of the intent. The target
+                # is parked and resumed once the detour is done.
+                if idx in self._assigned:
+                    self._deferred[idx] = self._assigned.pop(idx)
+                continue
+            prev = self._assigned.get(idx) or self._deferred.pop(idx, None)
             if prev is None:
                 continue
             ti = by_key.get(prev)
@@ -526,7 +601,8 @@ class Engine:
                         big if (tasks[j].needs and inv.get(tasks[j].needs, 0) <= 0)
                         else (abs(tasks[j].x - ux) + abs(tasks[j].y - uy)
                               + p_weight * tasks[j].prio
-                              + self._role_cost(roles[i], tasks[j], rp))
+                              + self._role_cost(roles[i], tasks[j], rp)
+                              + self._here_bonus((ux, uy), tasks[j], hb))
                         for j in avail
                     ])
                 if len(free) <= len(avail):
@@ -552,7 +628,8 @@ class Engine:
                     if cand in taken or (t.needs and inv.get(t.needs, 0) <= 0):
                         continue
                     pairs.append(((abs(t.x - ux) + abs(t.y - uy)) + p_weight * t.prio
-                                  + self._role_cost(roles[idx], t, rp), idx, cand))
+                                  + self._role_cost(roles[idx], t, rp)
+                                  + self._here_bonus((ux, uy), t, hb), idx, cand))
             pairs.sort()
             claimed: set[int] = set()
             for _, idx, cand in pairs:
@@ -577,7 +654,8 @@ class Engine:
                 # Distance and priority on one scale: a task `priority_weight` tiles further
                 # away must be a whole priority level more urgent to be worth the walk.
                 key = ((abs(t.x - ux) + abs(t.y - uy)) + p_weight * t.prio
-                       + self._role_cost(roles[idx], t, rp))
+                       + self._role_cost(roles[idx], t, rp)
+                       + self._here_bonus((ux, uy), t, hb))
                 if best_key is None or key < best_key:
                     best, best_key = cand, key
             if best is not None:

@@ -6,7 +6,7 @@ use crate::state::*;
 pub const DEFAULT_I0: i64 = 10_000;
 pub const PRICE_FLOOR: i64 = 1;
 
-/// `_shape`, `:54`. Unknown names fall through to identity, matching the reference's `return x`.
+/// `_shape`, `:67`. Unknown names fall through to identity, matching the reference's `return x`.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Shape {
     Linear,
@@ -14,8 +14,13 @@ pub enum Shape {
     Sqrt,
     Log,
     Log10,
+    Hinge,
     Identity,
 }
+
+/// `HINGE_GAIN`, `:60`. New in 1.32.7: CARROT, TOMATO and EGG price below I0 through this shape,
+/// so scarcity in those three runs away quadratically once the drain passes T.
+pub const HINGE_GAIN: f64 = 8.0;
 
 pub fn shape_from_name(name: &str) -> Shape {
     match name {
@@ -24,11 +29,14 @@ pub fn shape_from_name(name: &str) -> Shape {
         "sqrt" => Shape::Sqrt,
         "log" => Shape::Log,
         "log10" => Shape::Log10,
+        "hinge" => Shape::Hinge,
         _ => Shape::Identity,
     }
 }
 
-fn shape(f: Shape, x: f64) -> f64 {
+/// `t` is the curve's own T. Only `hinge` reads it — it is scaled so that `f(T) == 1`, which is
+/// what keeps `target` meaning the same thing it does for every other shape (`:57-59`).
+fn shape(f: Shape, x: f64, t: f64) -> f64 {
     let x = x.max(0.0);
     match f {
         Shape::Linear | Shape::Identity => x,
@@ -36,6 +44,15 @@ fn shape(f: Shape, x: f64) -> f64 {
         Shape::Sqrt => x.sqrt(),
         Shape::Log => (1.0 + x).ln(),
         Shape::Log10 => (1.0 + x).log10(),
+        Shape::Hinge => {
+            // Degenerates to linear if T is missing or non-positive (`:75-76`).
+            if t <= 0.0 {
+                x
+            } else {
+                let u = x / t;
+                u + HINGE_GAIN * (u - 1.0).max(0.0).powi(2)
+            }
+        }
     }
 }
 
@@ -76,15 +93,16 @@ impl MarketParam {
     }
 }
 
-/// MARKET_PARAMS, `:41`, in PRODUCTS order.
+/// MARKET_PARAMS, `:41`, in PRODUCTS order. CARROT / TOMATO / EGG went `hinge` below I0 in
+/// 1.32.7 (carrot's below_target also moved 0.20 -> 1.00); everything else is unchanged.
 pub fn default_market_params() -> Vec<MarketParam> {
     vec![
         MarketParam::new(25.0, DEFAULT_I0, 400.0, "sqrt", 0.80, "log", 0.20),      // WHEAT
-        MarketParam::new(35.0, DEFAULT_I0, 450.0, "log", 0.20, "sqrt", 0.70),      // CARROT
-        MarketParam::new(60.0, DEFAULT_I0, 200.0, "linear", 0.40, "sqrt", 0.60),   // TOMATO
+        MarketParam::new(35.0, DEFAULT_I0, 450.0, "hinge", 1.00, "sqrt", 0.70),    // CARROT
+        MarketParam::new(60.0, DEFAULT_I0, 200.0, "hinge", 0.40, "sqrt", 0.60),    // TOMATO
         MarketParam::new(120.0, DEFAULT_I0, 100.0, "sqrt", 0.70, "linear", 1.60),  // STRAWBERRY
         MarketParam::new(250.0, DEFAULT_I0, 300.0, "log", 0.20, "sq", 3.60),       // MELON
-        MarketParam::new(50.0, DEFAULT_I0, 332.0, "linear", 0.40, "log", 0.20),    // EGG
+        MarketParam::new(50.0, DEFAULT_I0, 332.0, "hinge", 0.40, "log", 0.20),     // EGG
         MarketParam::new(160.0, DEFAULT_I0, 122.0, "sqrt", 0.60, "linear", 1.60),  // MILK
         MarketParam::new(200.0, DEFAULT_I0, 105.0, "log", 0.20, "sq", 3.20),       // WOOL
         MarketParam::new(100.0, DEFAULT_I0, 200.0, "linear", 0.40, "linear", 0.40), // FERTILIZER
@@ -97,11 +115,11 @@ pub fn default_market_params() -> Vec<MarketParam> {
 pub fn market_price(item: usize, inventory: i64, params: &[MarketParam]) -> i64 {
     let p = &params[item];
     let price = if inventory < p.i0 {
-        let amp = p.below_target * p.base / shape(p.below_shape, p.t);
-        p.base + amp * shape(p.below_shape, (p.i0 - inventory) as f64)
+        let amp = p.below_target * p.base / shape(p.below_shape, p.t, p.t);
+        p.base + amp * shape(p.below_shape, (p.i0 - inventory) as f64, p.t)
     } else {
-        let amp = p.above_target * p.base / shape(p.above_shape, p.t);
-        p.base - amp * shape(p.above_shape, (inventory - p.i0) as f64)
+        let amp = p.above_target * p.base / shape(p.above_shape, p.t, p.t);
+        p.base - amp * shape(p.above_shape, (inventory - p.i0) as f64, p.t)
     };
     (round_half_even(price) as i64).max(PRICE_FLOOR)
 }

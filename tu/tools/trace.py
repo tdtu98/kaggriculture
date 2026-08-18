@@ -30,8 +30,9 @@ import os
 TRACE_DIR = "traces"
 
 
-def trace_path(a: str, b: str, seed: int) -> str:
-    return os.path.join(TRACE_DIR, f"{a}_vs_{b}_s{seed}.json")
+def trace_path(a: str, b: str, seed: int, sub: str = "") -> str:
+    """`--sub NAME` groups an experiment's traces in `traces/NAME/` instead of the top level."""
+    return os.path.join(TRACE_DIR, sub, f"{a}_vs_{b}_s{seed}.json")
 
 
 def save(tr: dict, path: str) -> int:
@@ -165,6 +166,7 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=5)
     ap.add_argument("--seeds", help="comma-separated, e.g. 5,6,7 — records one trace each")
     ap.add_argument("--out")
+    ap.add_argument("--sub", default="", help="subfolder under traces/ to group an experiment")
     ap.add_argument("--load")
     ap.add_argument("--crop", help="follow one crop type through the season")
     ap.add_argument("--actions", action="store_true")
@@ -176,7 +178,7 @@ def main() -> None:
         total = 0
         for sd in [int(x) for x in args.seeds.split(",")]:
             t = record(args.a, args.b, sd)
-            path = args.out or trace_path(args.a, args.b, sd)
+            path = args.out or trace_path(args.a, args.b, sd, args.sub)
             n = save(t, path)
             total += n
             print(f"  {path}  ({n/1048576:.1f} MB)")
@@ -184,7 +186,7 @@ def main() -> None:
         return
     else:
         tr = record(args.a, args.b, args.seed)
-        path = args.out or trace_path(args.a, args.b, args.seed)
+        path = args.out or trace_path(args.a, args.b, args.seed, args.sub)
         print(f"wrote {path}  ({save(tr, path)/1048576:.1f} MB)")
 
     summarise(tr)

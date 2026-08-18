@@ -17,7 +17,7 @@
     },
     "melon_stagger": 0,
     "goose_target": 0,
-    "cow_target": 6,
+    "cow_target": 5,
     "sheep_target": 8,
     "animals_before_seeds": false,
     "care": true,
@@ -39,6 +39,16 @@
     "sell_all_after_day": 27,
     "forecast_weight": 0.0,
     "forecast_horizon": 15,
-    "harvest_early": false
-  }
+    "harvest_early": false,
+    "role_penalty": 1.5
+  },
+  "promoted_by": "tools/promote.py --candidate role1.5-cow5 --seed0 1230000",
+  "gate": {
+    "stage1": "84.0% [80.5, 87.0] n=500, $52,036 vs $45,951",
+    "stage2": "no new losses; x-dumper loss shared with the incumbent",
+    "stage3": "no neighbour better (closest cow_target=6 at 60.4%)"
+  },
+  "vs_boatlee": "$44,903 vs $125,326 (was $37,036) -- still 0% winrate",
+  "supersedes": "search/champion_pre_role.json",
+  "experiment": "E46"
 }

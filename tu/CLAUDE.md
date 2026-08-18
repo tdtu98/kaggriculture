@@ -4,31 +4,42 @@ Kaggle **Kaggriculture** competition agent. Two-player farming sim; reward is fi
 
 ## Read first
 
-- `PLAN2.md` — **current plan. Start here.** Written after the first external opponent beat our
-  champion 0-40 and invalidated v1's sequencing. Carries the measured causal chain, the refuted v1
-  claims, and a roadmap where every phase has a kill criterion fixed before the work starts.
-- `PLAN.md` — v1. Superseded for strategy and sequencing; its environment facts and market
-  economics remain valid except where marked [REFUTED].
-- `TASKS2.md` — **current task list.** Executable breakdown of `PLAN2.md`: per-task build detail,
-  verification method, binary done-when, and a kill criterion fixed before the work starts. Check
-  the task ID before starting.
-- `TASKS.md` — v1. Kept for the completed simulator/arena/search work, which still stands.
+- `PLAN3.md` — **current plan. Start here.** The decision to build a new agent derived from
+  boatlee's 719-step action trace instead of continuing to tune `agent/`. Explains what the trace
+  is, the choreography constraint that limits what can be changed, the three safe zones, and a
+  kill criterion for every phase. §8 carries the engine line as the named fallback, so it can be
+  resumed without re-deriving it.
+- `TASKS3.md` — **current task list.** Executable breakdown of `PLAN3.md` (tasks R0–R4). Check the
+  task ID before starting.
+- `PLAN2.md` — v2. Superseded for **sequencing only**. Its diagnosis of our engine, its measured
+  causal chain and its experiment record all still stand and are cited throughout v3.
+- `TASKS2.md` — v2. Still the task list for the engine line (`PLAN3.md` §8).
+- `PLAN.md` / `TASKS.md` — v1. Kept for the completed simulator/arena/search work, which still
+  stands. Superseded for strategy except where marked [REFUTED].
 - `docs/README.md`, `docs/AGENTS.md` — the competition's own rules. Verified accurate against source.
+- `session_line/README.md` — the Claude-session executor line (`executor.py`, the planners,
+  `warfare`/`metered`/`denial`), kept verbatim and loaded through `session_line.load`. `PLAN_v4`'s
+  Track F is entirely about `session_line/executor.py`. Read that README before touching it: the
+  executor swallows every exception and returns all-PASS, so a wiring mistake scores the $3,000
+  starting bank and looks like a result.
 - `reference/orbit_war/OVERVIEW.md` — analysis of a past competition's PPO agent, kept as an
   architectural reference. Its per-unit-decision + masked-candidate-scoring pattern is what we borrow.
 
 ## Environment
 
-**Use `/opt/miniconda3/bin/python`.** `/usr/bin/python3` has no `kaggle_environments`.
+**Use `.venv/bin/python` (this repo's own venv, `make setup` builds it).** It pins
+`kaggle-environments==1.32.7`, which is what PLAN_v4 is written against. The shared
+`/opt/miniconda3` install is deliberately left at 1.32.6 for `../kaggriculture`, so running this
+repo's code under miniconda silently measures the *old* market curve — see E54.
 
 Env source (the ground truth for all mechanics):
-`/opt/miniconda3/lib/python3.13/site-packages/kaggle_environments/envs/kaggriculture/kaggriculture.py`
+`.venv/lib/python3.13/site-packages/kaggle_environments/envs/kaggriculture/kaggriculture.py`
 
-A full 720-step episode runs in ~0.85 s single-core (~860 steps/s), so large-scale simulation and
+A full 720-step episode runs in ~0.89 s single-core (~806 steps/s), so large-scale simulation and
 parameter search are cheap. Prefer measuring over reasoning about mechanics.
 
 ```bash
-/opt/miniconda3/bin/python -c "
+.venv/bin/python -c "
 from kaggle_environments import make
 env = make('kaggriculture', configuration={'episodeSteps': 720, 'seed': 7}, debug=True)
 env.run(['main.py', 'starter'])
@@ -36,7 +47,8 @@ print([(i, s['reward'], s['status']) for i, s in enumerate(env.steps[-1])])
 "
 ```
 
-Built-in opponents: `"pass"`, `"random"`, `"starter"`. Baselines: `starter` = $3,496, `random` = $0.
+Built-in opponents: `"pass"`, `"random"`, `"starter"`. Baselines: `starter` = $3,507 at 1.32.7
+(was $3,488 at 1.32.6), `random` = $0.
 
 ## Working notes
 
@@ -80,6 +92,25 @@ Built-in opponents: `"pass"`, `"random"`, `"starter"`. Baselines: `starter` = $3
   `Params()` being wheat-based made CEM optimize against a weak agent while reporting a +$34k
   improvement worth $207 (E8).
 - **A search result is a hypothesis** until it wins in the arena on seeds the search never saw.
+- **An order is not a sale. Count units that arrive, never quantities requested.** Traces and action
+  logs record what an agent *asks* for; the environment decides what it *gets*. `SELL` moves
+  `min(requested, shed)` and `BUY_PRODUCT` fails outright against a full shed
+  (`kaggriculture.py:641-658`). This has now cost three conclusions in one session: "our champion
+  buys 10,788 wheat" (most orders never settled, E48); "extra cows produce zero extra milk revenue —
+  241 in both arms" (241 was *ordered*; production was 174 vs 220 and **all of it sold**, E50); and
+  it nearly took R2e. Measure by differencing shed + unit inventories across turns, which counts
+  units that actually appeared.
+- **Prove the change fired before you read its score.** A result from a change that never took
+  effect is measuring noise, and it looks exactly like a refutation — "the engine cannot express
+  this" and "this strategy does not work" produce identical numbers (E44). Every change emits a
+  counter proving it happened; check the counter first. A zero counter is an unfinished
+  implementation, not a negative result. Four separate measurements have already been lost this way:
+  a profile tool that read the roster at hour 0 just after `_end_of_day` clears it and reported the
+  workforce 3x too small (E44); a comparison run against a re-implementation of the engine's rule
+  inside the analysis script (E39); four parity tests that passed while proving nothing (E36); and
+  three defects in `role_penalty` that the money numbers would never have revealed (E46). Assert
+  behaviour **in play**, not that a helper returned the right value — and where it is cheap, mutate
+  the code and confirm the test fails.
 - **Nothing below ~80 games is believable since 1.32.6.** Shop draws vary per game (E33), and three
   separate results this session looked real at 16-48 games and vanished at 80+: the equal-land gap
   (E37 -> E41), optimal assignment (E39 -> E40), and the scaling config (E42). A promising number
@@ -110,6 +141,13 @@ Built-in opponents: `"pass"`, `"random"`, `"starter"`. Baselines: `starter` = $3
   `one-shot cap + drain/day x days` and the drain term dominates (D17). Melon: zero shops, cannot
   regenerate. Milk: three. Judging by the price-curve integral ranked the markets almost inversely
   and cost a 2.4x improvement — it is the single most expensive mistake in this project.
+  **But this rule governs *sustained* capacity, not any single sale, and the difference has now cost
+  a wrong prediction (E48).** Shop demand sets how fast a market *recovers*; the price curve still
+  sets what one batch fetches. Melon has zero shops and boatlee sells ~114 units of it a season
+  profitably — 114 is only 0.38xT, so `above_func=sq` drops the price 250 -> ~$120 and it remains
+  the most valuable unit on the board. Deleting melon from their plan cost them **$18,882**. Melon
+  fails at *scale* (60 tiles -> 360 units -> the floor, E41), not at their volume. Before calling a
+  product a mistake, check the volume against `T`, not just the shop count.
 - **Never evaluate against a weak fixed opponent.** Measured: `melon-wheat` earns 7% *more* than
   `melon` against `starter`, and then loses to it **32/32** head-to-head, its earnings collapsing
   60%. They compete for the same melon market. Rankings taken against `starter` are wrong

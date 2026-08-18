@@ -71,9 +71,14 @@ def agent(obs):
       the runner may reuse the process for several games, so state must be rebuilt at the start of
       each episode. Detected from `day == 0 and hour == 0` — the only turn where both hold —
       rather than from object lifetime.
-    * **`obs["step"]` does not exist for seat 1.** It is a framework field, not declared `shared`,
-      so `obs.get("step", 0)` silently reads 0 there on every turn. Nothing here reads it; `day`
-      and `hour` are shared and are used instead.
+    * **~~`obs["step"]` does not exist for seat 1.~~ [REFUTED E21]** It reaches **both** seats,
+      correct on all 719 turns. The original claim came from reading `env.state[1].observation` —
+      the stored *replay* state, where shared fields are stripped for seats above 0 — which is not
+      what an agent receives: the framework rebuilds the observation per-agent in
+      `Environment.__get_shared_state` (`core.py:754-767`) and `step` survives that rebuild.
+      `agent/relay.py` indexes its action table by `obs["step"]` and is bit-identical to the
+      reference agent in **seat 1** over 20 seeds (`tests/test_relay_parity.py`), which would be
+      impossible if this were true. Nothing here reads it regardless; `day` and `hour` are used.
     """
     global _ENGINE
     try:

@@ -19,14 +19,21 @@ from __future__ import annotations
 
 import os
 import sys
+import sysconfig
 
 import coverage
 
 # Start measuring before kaggriculture.py is imported, so its module-level tables count.
 # coverage 7 skips site-packages unless the path is named explicitly, and a glob is not enough —
 # it has to be the resolved absolute file.
+#
+# Resolved via sysconfig, not `os.__file__`: a venv does not copy the stdlib, so `os.__file__`
+# points at the *base* interpreter and the old expression silently audited a different
+# installation's copy of the environment. That failure is quiet and total -- coverage attaches to
+# a file nothing imports, every line reads as unexecuted, and the gate reports 0% while the suite
+# passes. `purelib` follows the active interpreter, venv or not.
 _REF_REL = "kaggle_environments/envs/kaggriculture/kaggriculture.py"
-_REF_FILE = os.path.join(os.path.dirname(os.__file__), "site-packages", _REF_REL)
+_REF_FILE = os.path.join(sysconfig.get_paths()["purelib"], _REF_REL)
 assert os.path.exists(_REF_FILE), _REF_FILE
 COV = coverage.Coverage(branch=True, include=[_REF_FILE])
 COV.start()
