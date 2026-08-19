@@ -1,0 +1,227 @@
+# Kaggriculture Improvement Ideas
+
+## Purpose
+
+This file is the restart point for improving `02_inspect_top1` after the
+verified premium-market promotion. It records what is already proven, what
+failed, and which experiments have the best chance of producing a larger gain.
+Do not modify the promoted submission until a new candidate passes fresh,
+paired-seat qualification.
+
+## Current verified reference
+
+- Submission: `another_work/02_inspect_top1/main.py`
+- Submission SHA-256:
+  `ce87aeabfe0141cfda004ee8f78ca272570766d20039b004f31d8c034ba12d06`
+- Opponent used for promotion: `another_work/01_baseline3k/main.py`
+- Baseline SHA-256:
+  `f029fa0cb66a9eb509afbe44e3f59b800332d0419db91607183410e4089c4d19`
+- Environment: Kaggle Environments/Kaggriculture `1.32.7`, Python `3.12.9`
+- Confirmed result: 88 wins and 12 losses over seeds `50..99`, with the
+  candidate in both seats
+- Paired mean: `+866.54`
+- Paired median: `+785.0`
+- Deterministic paired-mean 95% bootstrap interval:
+  `[+769.28, +973.98]`
+- Seat means: `+919.22` and `+813.86`
+- All 50 paired-seed margins were positive
+- Verified latency: comfortably below the `1 ms` mean and `2 ms` p95 gates
+
+The current agent preserves `01_baseline3k`'s complete production and movement
+route. Its only enabled behavioral change is safe one-to-four-step
+front-running of planned `MELON`, `MILK`, `STRAWBERRY`, and `WOOL` sales.
+
+## Main lesson from the top-100 replays
+
+The strongest transferable pattern was not a complete replay trace. Top agents
+combine a stable opening with a small number of discrete decisions based on
+the shops that unlock. Copying a medoid route directly failed against the
+strong baseline, but transferring one bounded market decision succeeded.
+
+The next candidate should follow the same principle:
+
+1. Keep the reliable baseline movement path and common prefix.
+2. Observe live town shops and actual farm state.
+3. Change only future production targets that remain feasible.
+4. Test every policy independently before combining it with another policy.
+
+## Priority 1: Diagnose wasted route actions
+
+Before changing production, inspect games where the current agent loses in one
+seat or has a low paired margin. Record intended actions and the next observed
+state, then classify wasted work:
+
+- planting without the required seed;
+- placing an animal or item without carried inventory or a valid tile;
+- care, feed, harvest, or fertilizer actions on an incompatible tile;
+- weed interruptions that invalidate a later action;
+- purchases that fail because of money, inventory, or order capacity;
+- seeds or animals that remain unused at the end of the episode;
+- excessive feed wheat or shed congestion.
+
+Do not add a general field guard immediately. First count each failure type and
+identify the exact steps and shop environments where it costs money. A repair
+policy should handle only demonstrated failures and preserve all unrelated
+baseline actions.
+
+## Priority 2: Baseline-native livestock allocation
+
+The replay corpus contained four coherent livestock targets:
+
+| Shop situation | Candidate target to test | Reason |
+| --- | --- | --- |
+| Default or milk-heavy | 10 cows / 4 sheep | Preserve the strong baseline bias |
+| Low milk/wool demand | 8 cows / 6 sheep | More balanced production |
+| Yarn Store appears later | 6 cows / 8 sheep | Increase wool without an extreme switch |
+| Yarn Store appears early | 6 cows / 12 sheep | Strong wool specialization |
+
+These are hypotheses, not approved routes. The earlier replay-route candidate
+used similar branches and still lost overall. A new branch must be constructed
+forward from the verified baseline's live state, not copied or spliced from a
+raw replay.
+
+Safe implementation requirements:
+
+- branch only at a state-equivalent handoff;
+- preserve farmer and hand coordinates unless a changed production action
+  makes a local adjustment necessary;
+- count animals purchased, carried, placed, and still pending separately;
+- verify pasture capacity before buying;
+- reserve sufficient wheat and money for the selected animals;
+- never leave animals permanently unplaced;
+- freeze a selected branch for the rest of the episode;
+- fall back to the current verified route on missing or malformed town data.
+
+The replay analysis found safe comparison points at step 144 for the early-Yarn
+branch and step 216 for the later branches. Reprove state equivalence against
+the current promoted route before using those points in a new candidate.
+
+## Priority 3: Shop-aware crop allocation
+
+Use live unlocked shops to bias future seed purchases and planting quantities.
+The exact demand relationships currently encoded by the environment analysis
+are:
+
+| Shop | Products with demand |
+| --- | --- |
+| Bakery | Egg, wheat |
+| Pizza Shop | Milk, tomato, wheat |
+| Brunch Spot | Egg, wheat, strawberry |
+| Yarn Store | Wool |
+| Ice Cream Shop | Strawberry, milk, wheat |
+| Pet Cafe | Carrot |
+| Smoothie Shop | Strawberry, milk |
+| Farmers Market | Wheat, carrot, tomato, strawberry |
+
+Start with future purchases and plantings after the shop decision. Do not
+rewrite the opening crop layout until a later-phase experiment proves that a
+larger route change is necessary. Every crop branch must account for seed
+availability, mature-harvest timing, shed capacity, and remaining sale windows.
+
+Recommended isolated crop experiments:
+
+1. Increase strawberry production only for repeated strawberry-demand shops.
+2. Increase tomato production only for Pizza Shop or Farmers Market.
+3. Reduce purchases that historically remain unused.
+4. Adjust wheat last because it is both a sale product and livestock feed.
+
+## Priority 4: Narrow live route repair
+
+After the diagnostics identify recurring invalid actions, test one repair at a
+time. Examples include:
+
+- dig a live weed, remember the displaced intended action, and retry it once;
+- suppress a care/feed/harvest action only when the live tile proves it invalid;
+- cap a purchase by live money and placement capacity;
+- retry a missed critical purchase only when its target, money, and future
+  placement are all proven.
+
+Repairs must be idempotent, isolated by seat, and reset when the step moves
+backwards. They must never create an unbounded purchase loop or shift the
+remaining action schedule silently.
+
+## Lower-priority market experiments
+
+The current sale-timing overlay is already a consistent but modest improvement.
+Only revisit it after production experiments, and keep changes isolated:
+
+- make the four-step lookahead item-specific;
+- use live prices as an additional front-run condition;
+- cap front-running when shed inventory is needed for a near-term field action;
+- test shop-specific sale quantities without delaying a sale past demand.
+
+Do not combine these ideas with a production change during the first screen.
+
+## Approaches that should not be repeated unchanged
+
+- Raw replay-route substitution: paired mean `-2,187.77`.
+- Broad replay-derived field guards: paired mean `-2,550.58`.
+- Generic purchase recovery: paired mean `-81,059.71`.
+- Broad sale capping: paired mean `-4,883.98`.
+- Waiting to sell until after demand: paired mean `-84,609.6` in screening.
+
+These results do not prove that every narrow repair is harmful. They prove that
+the previous broad controllers and raw route should not be re-enabled or
+combined without a new isolated hypothesis and fresh evidence.
+
+## Recommended experiment order
+
+1. Build a read-only route-failure report for the current agent.
+2. Test one early-Yarn livestock branch derived from the baseline route.
+3. Test one later-Yarn livestock branch.
+4. Test one milk/strawberry production branch.
+5. Add only the highest-value demonstrated route repair.
+6. Test crop allocation after livestock and repair effects are understood.
+7. Consider combinations only when each component is independently positive.
+
+## Benchmark protocol for the next candidate
+
+The primary comparison should be against the current promoted `02` agent, not
+against an obsolete development candidate. Keep `01_baseline3k` as a secondary
+sanity opponent.
+
+Before coding, predeclare fresh, non-overlapping seeds. A suggested next panel
+is:
+
+- screen: seeds `100..109`, both seats, 20 games per variant;
+- confirmation: seeds `110..159`, both seats, exactly 100 games for the single
+  frozen winner.
+
+Promotion requires all of the following against the current promoted `02`:
+
+- every game finishes `DONE`;
+- every reward equals final money;
+- exactly one complete pair for every seed;
+- paired mean greater than zero;
+- paired median greater than zero;
+- more than 55 wins from 100 games;
+- positive mean in both candidate seats;
+- deterministic paired-mean 95% bootstrap lower bound greater than zero;
+- mean decision latency below `1 ms`;
+- p95 decision latency below `2 ms`;
+- standalone Python with no runtime replay or repository-file reads.
+
+If no policy passes, keep the current `main.py` byte-for-byte unchanged. Never
+weaken a gate or reuse confirmation seeds after seeing the result.
+
+## Resume checklist
+
+1. Confirm the active reference SHA-256 is still
+   `ce87aeabfe0141cfda004ee8f78ca272570766d20039b004f31d8c034ba12d06`.
+2. Confirm Kaggriculture is still version `1.32.7`.
+3. Re-read `another_work/02_inspect_top1/BENCHMARK_FINDINGS.md` and
+   `another_work/02_inspect_top1/STRATEGY.md`.
+4. Verify all 100 source replay JSON files remain under `duy_explore`.
+5. Choose exactly one hypothesis from this file.
+6. Write the design and predeclare seeds and promotion gates.
+7. Build an isolated candidate; do not edit the submission directly.
+8. Use tests to prove disabled parity with the current promoted `02`.
+9. Screen once, freeze once, and confirm once on fresh seeds.
+10. Promote only exact evaluator-rendered bytes after independent review.
+
+## Success target
+
+The present market overlay gains about one percent in average money against
+`01_baseline3k`. The next project should target a larger production-driven
+uplift while preserving the current 88% confirmation win rate, positive
+paired-seat behavior, and sub-millisecond decision speed.

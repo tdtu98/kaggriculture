@@ -49,14 +49,31 @@ Each invocation writes a timestamped directory under `benchmarks/results/`:
 
 - `games.csv` contains every seed, seat assignment, final score, status,
   outcome, and agent-A margin.
+- `paired_seeds.csv` contains one row per seed with agent A's seat-0 margin,
+  seat-1 margin, and their average. This is the primary statistical unit for
+  promotion decisions.
 - `summary.json` contains the exact protocol, agent paths and hashes,
-  environment/Python versions, and overall/per-seat aggregates.
+  environment/Python versions, overall/per-seat aggregates, paired-seed
+  aggregates, and a deterministic 10,000-resample 95% bootstrap interval for
+  the paired mean margin.
 - `summary.txt` is a compact human-readable report.
 
 Final bank money from the terminal observation is the canonical score. The
 runner also checks that terminal reward matches that value and requires both
 players to finish with `DONE`; otherwise it exits non-zero without producing an
 aggregate.
+
+## Interpreting paired results
+
+The two games for one seed share the same environment randomness but swap the
+agents' seats. Average those two candidate margins before estimating
+uncertainty; treating all games as independent would overstate the sample
+size. A promotion benchmark should require a positive paired mean and median,
+positive mean margins in both seats, and a bootstrap interval whose lower
+bound is above zero.
+
+The bootstrap uses RNG seed `20260814` and 10,000 resamples. These values and
+the 95% confidence level are written into each run's protocol metadata.
 
 ## Generate one replay on demand
 

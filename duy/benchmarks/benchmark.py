@@ -11,6 +11,7 @@ import itertools
 import json
 import math
 import platform
+import random
 import re
 import statistics
 import sys
@@ -39,6 +40,15 @@ CSV_FIELDS = (
     "margin",
     "outcome",
 )
+PAIRED_CSV_FIELDS = (
+    "seed",
+    "seat_0_margin",
+    "seat_1_margin",
+    "paired_margin",
+)
+BOOTSTRAP_RESAMPLES = 10_000
+BOOTSTRAP_SEED = 20_260_814
+BOOTSTRAP_CONFIDENCE = 0.95
 
 
 class BenchmarkError(RuntimeError):
@@ -297,6 +307,65 @@ def _summary_slice(results: list[dict]) -> dict:
     }
 
 
+def build_paired_rows(results: list[dict]) -> list[dict]:
+    """Pair each seed's two seat assignments and average their margins."""
+    grouped: dict[int, dict[int, float]] = {}
+    for result in results:
+        seed = int(result["seed"])
+        seat = int(result["agent_a_seat"])
+        seats = grouped.setdefault(seed, {})
+        if seat in seats:
+            raise BenchmarkError(
+                f"seed {seed} has duplicate agent-A seat {seat}"
+            )
+        seats[seat] = float(result["margin"])
+
+    rows = []
+    for seed in sorted(grouped):
+        if set(grouped[seed]) != {0, 1}:
+            raise BenchmarkError(
+                f"seed {seed} does not have a complete seat pair"
+            )
+        seat_zero = grouped[seed][0]
+        seat_one = grouped[seed][1]
+        rows.append(
+            {
+                "seed": seed,
+                "seat_0_margin": seat_zero,
+                "seat_1_margin": seat_one,
+                "paired_margin": (seat_zero + seat_one) / 2,
+            }
+        )
+    return rows
+
+
+def bootstrap_mean_ci(
+    values: list[float],
+    *,
+    resamples: int = BOOTSTRAP_RESAMPLES,
+    seed: int = BOOTSTRAP_SEED,
+) -> dict:
+    """Return a deterministic percentile bootstrap interval for the mean."""
+    if not values:
+        raise BenchmarkError("cannot bootstrap empty values")
+    if resamples <= 0:
+        raise BenchmarkError("bootstrap resamples must be positive")
+
+    rng = random.Random(seed)
+    count = len(values)
+    means = sorted(
+        statistics.mean(rng.choices(values, k=count))
+        for _ in range(resamples)
+    )
+    return {
+        "confidence": BOOTSTRAP_CONFIDENCE,
+        "lower": means[int(0.025 * (resamples - 1))],
+        "upper": means[int(0.975 * (resamples - 1))],
+        "resamples": resamples,
+        "seed": seed,
+    }
+
+
 def summarize(results: list[dict]) -> dict:
     """Summarize all games and each of agent A's seat assignments."""
     summary = _summary_slice(results)
@@ -305,6 +374,13 @@ def summarize(results: list[dict]) -> dict:
             [result for result in results if result["agent_a_seat"] == seat]
         )
         for seat in (0, 1)
+    }
+    paired_rows = build_paired_rows(results)
+    paired_values = [row["paired_margin"] for row in paired_rows]
+    summary["paired_seeds"] = {
+        "count": len(paired_rows),
+        "margin": _stats(paired_values),
+        "bootstrap_mean_95ci": bootstrap_mean_ci(paired_values),
     }
     return summary
 
@@ -318,7 +394,7 @@ def build_metadata(
 ) -> dict:
     """Capture the complete protocol and software identity for one run."""
     return {
-        "protocol_version": 1,
+        "protocol_version": 2,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "seed_start": seed_start,
         "seed_count": seed_count,
@@ -331,6 +407,11 @@ def build_metadata(
         "kaggle_environments_version": importlib.metadata.version(
             "kaggle-environments"
         ),
+        "bootstrap": {
+            "confidence": BOOTSTRAP_CONFIDENCE,
+            "resamples": BOOTSTRAP_RESAMPLES,
+            "seed": BOOTSTRAP_SEED,
+        },
     }
 
 
@@ -343,6 +424,9 @@ def format_summary(metadata: dict, summary: dict) -> str:
     margin = summary["margin"]
     seat_zero = summary["by_agent_a_seat"]["0"]
     seat_one = summary["by_agent_a_seat"]["1"]
+    paired = summary["paired_seeds"]
+    paired_margin = paired["margin"]
+    paired_ci = paired["bootstrap_mean_95ci"]
     seed_end = metadata["seed_start"] + metadata["seed_count"] - 1
     return "\n".join(
         [
@@ -388,6 +472,14 @@ def format_summary(metadata: dict, summary: dict) -> str:
                 f"win_rate={seat_one['win_rate']:.2%} "
                 f"mean_margin={seat_one['margin']['mean']:.2f}"
             ),
+            (
+                "Paired seed margin: "
+                f"seeds={paired['count']} "
+                f"mean={paired_margin['mean']:.2f} "
+                f"median={paired_margin['median']:.2f} "
+                f"95%_ci=[{paired_ci['lower']:.2f}, "
+                f"{paired_ci['upper']:.2f}]"
+            ),
             "",
         ]
     )
@@ -407,6 +499,12 @@ def write_artifacts(
         )
         writer.writeheader()
         writer.writerows(results)
+    with (output / "paired_seeds.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(
+            stream, fieldnames=PAIRED_CSV_FIELDS, lineterminator="\n"
+        )
+        writer.writeheader()
+        writer.writerows(build_paired_rows(results))
     (output / "summary.json").write_text(
         json.dumps(
             {"metadata": metadata, "summary": summary},

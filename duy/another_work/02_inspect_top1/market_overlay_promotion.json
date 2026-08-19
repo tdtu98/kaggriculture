@@ -1,0 +1,120 @@
+{
+  "baseline_sha256": "f029fa0cb66a9eb509afbe44e3f59b800332d0419db91607183410e4089c4d19",
+  "candidate_sha256": "ce87aeabfe0141cfda004ee8f78ca272570766d20039b004f31d8c034ba12d06",
+  "failures": [],
+  "flags": {
+    "_ENABLE_ADAPTIVE_FRONT_RUN": true,
+    "_ENABLE_DEMAND_DEFERRAL": false
+  },
+  "latency": {
+    "calls": 720,
+    "import_ms": 8.474791,
+    "maximum_ms": 0.454334,
+    "mean_ms": 0.17308871805555556,
+    "p50_ms": 0.1755205,
+    "p95_ms": 0.2085
+  },
+  "phase": "confirm",
+  "promoted": true,
+  "protocol": {
+    "games": 100,
+    "seed_count": 50,
+    "seed_start": 50,
+    "steps": 720
+  },
+  "source_candidate_sha256": "4c9d0d88b37c24cf0b211b12d2719bed68d0e3bcfba9a6a4dc4597236d963594",
+  "summary": {
+    "agent_a_money": {
+      "maximum": 142837.0,
+      "mean": 88363.62,
+      "median": 89187.0,
+      "minimum": 37429.0
+    },
+    "agent_b_money": {
+      "maximum": 142075.0,
+      "mean": 87497.08,
+      "median": 87711.5,
+      "minimum": 36772.0
+    },
+    "by_agent_a_seat": {
+      "0": {
+        "agent_a_money": {
+          "maximum": 142837.0,
+          "mean": 88389.96,
+          "median": 88804.5,
+          "minimum": 37429.0
+        },
+        "agent_b_money": {
+          "maximum": 142075.0,
+          "mean": 87470.74,
+          "median": 88221.5,
+          "minimum": 36920.0
+        },
+        "games": 50,
+        "losses": 6,
+        "margin": {
+          "maximum": 4237.0,
+          "mean": 919.22,
+          "median": 769.0,
+          "minimum": -482.0
+        },
+        "ties": 0,
+        "win_rate": 0.88,
+        "wins": 44
+      },
+      "1": {
+        "agent_a_money": {
+          "maximum": 142837.0,
+          "mean": 88337.28,
+          "median": 89363.5,
+          "minimum": 37577.0
+        },
+        "agent_b_money": {
+          "maximum": 142075.0,
+          "mean": 87523.42,
+          "median": 87711.5,
+          "minimum": 36772.0
+        },
+        "games": 50,
+        "losses": 6,
+        "margin": {
+          "maximum": 2622.0,
+          "mean": 813.86,
+          "median": 787.0,
+          "minimum": -2179.0
+        },
+        "ties": 0,
+        "win_rate": 0.88,
+        "wins": 44
+      }
+    },
+    "games": 100,
+    "losses": 12,
+    "margin": {
+      "maximum": 4237.0,
+      "mean": 866.54,
+      "median": 781.0,
+      "minimum": -2179.0
+    },
+    "paired_seeds": {
+      "bootstrap_mean_95ci": {
+        "confidence": 0.95,
+        "lower": 769.28,
+        "resamples": 10000,
+        "seed": 20260814,
+        "upper": 973.98
+      },
+      "count": 50,
+      "margin": {
+        "maximum": 1955.0,
+        "mean": 866.54,
+        "median": 785.0,
+        "minimum": 339.0
+      }
+    },
+    "ties": 0,
+    "win_rate": 0.88,
+    "wins": 88
+  },
+  "variant": "adaptive_front_run"
+}

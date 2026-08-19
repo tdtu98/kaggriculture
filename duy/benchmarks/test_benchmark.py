@@ -161,6 +161,7 @@ class SummaryTests(unittest.TestCase):
     def test_summarizes_overall_and_each_agent_a_seat(self):
         results = [
             {
+                "seed": 3,
                 "agent_a_seat": 0,
                 "agent_a_money": 5000.0,
                 "agent_b_money": 4000.0,
@@ -168,6 +169,7 @@ class SummaryTests(unittest.TestCase):
                 "outcome": "win",
             },
             {
+                "seed": 3,
                 "agent_a_seat": 1,
                 "agent_a_money": 3000.0,
                 "agent_b_money": 3500.0,
@@ -175,26 +177,102 @@ class SummaryTests(unittest.TestCase):
                 "outcome": "loss",
             },
             {
+                "seed": 4,
                 "agent_a_seat": 0,
                 "agent_a_money": 4200.0,
                 "agent_b_money": 4200.0,
                 "margin": 0.0,
                 "outcome": "tie",
             },
+            {
+                "seed": 4,
+                "agent_a_seat": 1,
+                "agent_a_money": 4600.0,
+                "agent_b_money": 4200.0,
+                "margin": 400.0,
+                "outcome": "win",
+            },
         ]
 
         summary = benchmark.summarize(results)
 
-        self.assertEqual(summary["games"], 3)
+        self.assertEqual(summary["games"], 4)
         self.assertEqual(
             (summary["wins"], summary["losses"], summary["ties"]),
-            (1, 1, 1),
+            (2, 1, 1),
         )
-        self.assertAlmostEqual(summary["win_rate"], 1 / 3)
-        self.assertEqual(summary["agent_a_money"]["median"], 4200.0)
-        self.assertAlmostEqual(summary["margin"]["mean"], 500.0 / 3)
+        self.assertAlmostEqual(summary["win_rate"], 0.5)
+        self.assertEqual(summary["agent_a_money"]["median"], 4400.0)
+        self.assertAlmostEqual(summary["margin"]["mean"], 225.0)
         self.assertEqual(summary["by_agent_a_seat"]["0"]["games"], 2)
         self.assertEqual(summary["by_agent_a_seat"]["1"]["losses"], 1)
+        self.assertEqual(summary["paired_seeds"]["count"], 2)
+        self.assertEqual(summary["paired_seeds"]["margin"]["mean"], 225.0)
+
+
+class PairedSummaryTests(unittest.TestCase):
+    def test_builds_one_row_per_complete_seed_pair(self):
+        results = [
+            {"seed": 7, "agent_a_seat": 0, "margin": 100.0},
+            {"seed": 7, "agent_a_seat": 1, "margin": 300.0},
+            {"seed": 8, "agent_a_seat": 0, "margin": -50.0},
+            {"seed": 8, "agent_a_seat": 1, "margin": 150.0},
+        ]
+
+        self.assertEqual(
+            benchmark.build_paired_rows(results),
+            [
+                {
+                    "seed": 7,
+                    "seat_0_margin": 100.0,
+                    "seat_1_margin": 300.0,
+                    "paired_margin": 200.0,
+                },
+                {
+                    "seed": 8,
+                    "seat_0_margin": -50.0,
+                    "seat_1_margin": 150.0,
+                    "paired_margin": 50.0,
+                },
+            ],
+        )
+
+    def test_rejects_missing_seat_from_pair(self):
+        with self.assertRaisesRegex(
+            benchmark.BenchmarkError, "complete seat pair"
+        ):
+            benchmark.build_paired_rows(
+                [{"seed": 7, "agent_a_seat": 0, "margin": 1.0}]
+            )
+
+    def test_rejects_duplicate_seat_in_pair(self):
+        with self.assertRaisesRegex(benchmark.BenchmarkError, "duplicate"):
+            benchmark.build_paired_rows(
+                [
+                    {"seed": 7, "agent_a_seat": 0, "margin": 1.0},
+                    {"seed": 7, "agent_a_seat": 0, "margin": 2.0},
+                ]
+            )
+
+    def test_constant_bootstrap_interval_is_exact(self):
+        self.assertEqual(
+            benchmark.bootstrap_mean_ci(
+                [25.0, 25.0], resamples=100, seed=9
+            ),
+            {
+                "confidence": 0.95,
+                "lower": 25.0,
+                "upper": 25.0,
+                "resamples": 100,
+                "seed": 9,
+            },
+        )
+
+    def test_bootstrap_rejects_empty_values_and_nonpositive_resamples(self):
+        with self.assertRaisesRegex(benchmark.BenchmarkError, "empty"):
+            benchmark.bootstrap_mean_ci([])
+        with self.assertRaisesRegex(benchmark.BenchmarkError, "positive"):
+            benchmark.bootstrap_mean_ci([1.0], resamples=0)
 
 
 class ArtifactTests(unittest.TestCase):
@@ -252,12 +330,29 @@ class ArtifactTests(unittest.TestCase):
             payload = json.loads((output / "summary.json").read_text())
             with (output / "games.csv").open() as stream:
                 rows = list(csv.DictReader(stream))
+            with (output / "paired_seeds.csv").open() as stream:
+                paired_rows = list(csv.DictReader(stream))
             self.assertNotIn(b"\r\n", (output / "games.csv").read_bytes())
             self.assertEqual(payload["metadata"]["seeds"], [4])
+            self.assertEqual(payload["metadata"]["protocol_version"], 2)
             self.assertEqual(payload["summary"]["games"], 2)
             self.assertEqual(len(rows), 2)
+            self.assertEqual(
+                paired_rows,
+                [
+                    {
+                        "seed": "4",
+                        "seat_0_margin": "500.0",
+                        "seat_1_margin": "500.0",
+                        "paired_margin": "500.0",
+                    }
+                ],
+            )
             self.assertIn(
                 "Agent A in seat 0", (output / "summary.txt").read_text()
+            )
+            self.assertIn(
+                "Paired seed margin", (output / "summary.txt").read_text()
             )
 
     def test_cli_rejects_selecting_same_agent_twice(self):
