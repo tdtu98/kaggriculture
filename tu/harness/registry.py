@@ -130,8 +130,46 @@ def _plan_agent(name: str, plan, note: str) -> PoolAgent:
     return PoolAgent(name=name, build=lambda: make_agent(plan), fingerprint=digest, note=note)
 
 
+#: Separator for O3's overlay flags: `compiler#frontrun=1`, `vec:...#counter_mix=1,slot_align=1`.
+#:
+#: The name has to determine the agent *completely*, because `run()` ships names to worker processes
+#: and each one resolves its own (that is why `VEC_PREFIX` encodes a whole genome into a string). An
+#: overlay is a `consts` edit rather than a gene (`Plan.with_consts`), so it needs its own suffix
+#: rather than a longer vector.
+CONST_SEP = "#"
+
+
+def const_name(base: str, **flags) -> str:
+    """`base` plus overlay flags, in a form `get()` round-trips."""
+    if not flags:
+        return base
+    return base + CONST_SEP + ",".join(f"{k}={v}" for k, v in sorted(flags.items()))
+
+
+def _parse_consts(spec: str) -> dict:
+    out: dict = {}
+    for piece in spec.split(","):
+        if not piece.strip():
+            continue
+        key, _, value = piece.partition("=")
+        value = value.strip()
+        try:
+            out[key.strip()] = int(value) if value and "." not in value else float(value)
+        except ValueError:
+            out[key.strip()] = value
+    return out
+
+
 def get(name: str) -> PoolAgent:
     """Resolve a pool name. Raises with the task ID for members that are not built yet."""
+    if CONST_SEP in name:
+        base, _, spec = name.partition(CONST_SEP)
+        inner = get(base)
+        plan = getattr(inner.build(), "plan", None)
+        if plan is None:
+            raise KeyError(f"'{base}' is not a plan-driven agent; '{CONST_SEP}' flags need one")
+        return _plan_agent(name, plan.with_consts(**_parse_consts(spec)),
+                           f"{inner.note} + consts {spec}")
     if name in PENDING:
         raise NotImplementedError(f"'{name}' does not exist yet — {PENDING[name]}")
     if name.startswith(VEC_PREFIX):

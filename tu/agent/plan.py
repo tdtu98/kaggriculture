@@ -167,14 +167,24 @@ class Cohort:
 class Branch:
     """A forward-only plan patch, applied when a condition first holds (O1).
 
-    Carried here so the representation is stable before O1 lands; `Plan.branches` is empty until
-    then. Patches must never dig a live plant or sell an animal — adaptivity changes what we do
-    *next*, not what we already committed.
+    Patches must never dig a live plant or sell an animal — adaptivity changes what we do *next*,
+    not what we already committed. `agent/branches.py` owns the conditions, the patch operations and
+    the forward-only gate; this is only the record.
+
+    The window is `[day_from, day_to]` **inclusive**, and it is a window rather than a start day
+    because instance counts only ever grow. "No milk shop by day 12" is a statement about day 12
+    and nothing else: left open-ended it would eventually fire on almost every seed, which is a
+    different hypothesis than the one being tested. `day_to = NEVER` reads as "from `day_from` on".
+
+    `name` labels the branch's effect counters (`branch_<name>_fired`); it defaults to the branch's
+    index in the plan when empty.
     """
 
     day_from: int
     condition: str
     patch: dict
+    day_to: int = NEVER
+    name: str = ""
 
 
 @dataclass(frozen=True)
@@ -207,6 +217,21 @@ class Plan:
 
     def unlocked_by(self, day: int) -> set:
         return {"NW"} | {q for q, d in self.land_days.items() if d <= day}
+
+    def with_consts(self, **kw) -> "Plan":
+        """A copy carrying extra `consts`. How O3's overlay flags are switched on.
+
+        The overlays are **not genes**: adding four to `GENES` would re-index every stored vector
+        (`migrate` exists because that has already happened once) and O3's task is to measure each
+        overlay alone, which a searched gene cannot do. They ride in `consts`, which `decode` does
+        not write and `encode` does not read, so a genome round-trips unchanged through a plan that
+        carries them — the flags simply do not survive the trip, which is correct: a vector is a
+        strategy and an overlay is a policy switch on top of it. O4 promotes whichever ones win by
+        setting them in `decode`'s `consts` dict (or by adding genes, if it wants them searched).
+        """
+        from dataclasses import replace
+
+        return replace(self, consts={**(self.consts or {}), **kw})
 
     # ------------------------------------------------------------------ checks
 

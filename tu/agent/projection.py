@@ -154,6 +154,20 @@ def instances_present(day: int) -> int:
     return max(0, min(MAX_SHOP_INSTANCES, int(day) // SHOP_UNLOCK_INTERVAL))
 
 
+def drain_per_day(item: str, day: int, shops) -> float:
+    """A full day of town demand on `day`: known instances, expected new ones, town centre.
+
+    Lifted out of `Projection._drain` unchanged so `agent/season.py` can price a *rolled-forward*
+    day with the same arithmetic rather than a second copy of it (E39: a comparison run against a
+    re-implementation of the rule it was comparing). `Projection._drain` now delegates here, so the
+    two cannot drift; `tests/test_projection.py` pins them equal.
+    """
+    known = sum(SHOP_DRAIN_PER_DAY[s].get(item, 0) for s in shops)
+    extra = max(0, instances_present(day) - len(shops))
+    centre = 1.0 if item in TOWN_CENTER_PRODUCTS else 0.0
+    return known + extra * EXPECTED_DRAIN_PER_INSTANCE.get(item, 0.0) + centre
+
+
 # --------------------------------------------------------------------------- effect counters
 
 #: Season totals, per seat, so "did the hunter ever fire" is answerable from the harness rather than
@@ -232,11 +246,8 @@ class Projection:
         return out
 
     def _drain(self, item: str, day: int) -> float:
-        """A full day of town demand on `day`: known instances, expected new ones, town centre."""
-        known = sum(SHOP_DRAIN_PER_DAY[s].get(item, 0) for s in self.shops)
-        extra = max(0, instances_present(day) - len(self.shops))
-        centre = 1.0 if item in TOWN_CENTER_PRODUCTS else 0.0
-        return known + extra * EXPECTED_DRAIN_PER_INSTANCE.get(item, 0.0) + centre
+        """A full day of town demand on `day`. See `drain_per_day`, which is this, module-level."""
+        return drain_per_day(item, day, self.shops)
 
     def _drain_rest_of_today(self, item: str) -> float:
         """Only the consume events still ahead of us today — the board already shows the rest."""
@@ -293,6 +304,13 @@ def for_obs(obs, plan=None, horizon: int = HORIZON) -> Projection:
         # that never spiked, and the counters would report a fire that belonged to another game.
         _REDIRECTS.pop(seat, None)
         _REDIRECTS.pop((seat, "crop"), None)
+        # O3's counter-mix keeps its commitments here for the same reason and needs the same
+        # reset. It was omitted once and it did not fail loudly: the second game in a worker
+        # process inherited the first game's redirect map, so every cohort was already `in moved`,
+        # nothing was re-evaluated and `cohorts_redirected` came back **zero** — a change that
+        # never fired, wearing the counters of one that did (E44). Caught by a test that plays two
+        # games in one process, which is what the harness does 80 times.
+        _CONTESTED.pop(seat, None)
         STATS.pop(seat, None)
     key = (seat, step, int(horizon))
     hit = _CACHE.get(seat)
@@ -326,7 +344,7 @@ def _supply_schedule(obs, today: int, horizon: int) -> dict:
     out: dict = {}
     farms = obs.get("farms") or []
     for farm in farms:
-        _farm_supply(farm, today, horizon, out)
+        farm_supply(farm, today, horizon, out)
     # Our own shed is stock that exists and is already priced into nothing — it sells at the next
     # market turn. Theirs is invisible, which is the asymmetry O2 is for.
     shed = ((obs.get("private", {}) or {}).get("shed") or {})
@@ -343,7 +361,13 @@ def _add(out: dict, item: str, days_ahead: int, units: float, horizon: int) -> N
     slot[days_ahead] = slot.get(days_ahead, 0.0) + float(units) * SELL_THROUGH.get(item, 1.0)
 
 
-def _farm_supply(farm, today: int, horizon: int, out: dict) -> None:
+def farm_supply(farm, today: int, horizon: int, out: dict) -> None:
+    """Accumulate one farm's standing crops and animals into `out` (`{item: {days_ahead: units}}`).
+
+    Public because O2 points it at the *opponent's* farm: their tiles are shared observation
+    (`kaggriculture.py:261,271`), so the same walk answers the same question for either seat, and a
+    second copy of it in `agent/opponent.py` is exactly the re-implementation E39 warns about.
+    """
     for row in farm.get("tiles") or []:
         for tile in row:
             if not isinstance(tile, dict):
@@ -408,10 +432,12 @@ def reset(seat: int | None = None) -> None:
     """Season reset. `main_v4` rebuilds its per-seat state on step 0; this follows it."""
     if seat is None:
         _REDIRECTS.clear()
+        _CONTESTED.clear()
         _CACHE.clear()
         STATS.clear()
         return
     _REDIRECTS.pop(seat, None)
+    _CONTESTED.pop(seat, None)
     _CACHE.pop(seat, None)
     STATS.pop(seat, None)
 
@@ -524,6 +550,207 @@ def redirect(obs, plan, day: int):
 
 def _closed(committed: dict, budget: int) -> bool:
     return sum(committed.values()) >= budget
+
+
+# --------------------------------------------------------------------------- O3 counter-mix
+
+#: Crops a contested cohort may be moved *to*. Every crop the plan language has, minus nothing:
+#: unlike `REDIRECTABLE` (which is about which spikes are worth *chasing*), this list is about
+#: which ground is worth standing on when the one we planned is about to be flooded, and that
+#: includes the flooded crop's obvious substitutes.
+COUNTER_MIX_CROPS = ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON")
+
+#: Default contest threshold, as a fraction of the product's market `T`. `T` is the curve's own
+#: scale parameter — the inventory excess at which `above_target` is fully paid
+#: (`kaggriculture.py:192-206`) — so "their supply into our window is worth half a `T`" is the
+#: natural units for "this market will be gone before we get there", and it is the same normaliser
+#: `scarcity_signal` uses. Overridable through `plan.consts["counter_mix_threshold"]`.
+COUNTER_MIX_THRESHOLD = 0.5
+
+#: How much better the replacement has to be before a planned cohort is overwritten. The same
+#: argument as `SWITCH_MARGIN` and deliberately the same number: a contested cohort that has no
+#: clearly better home should be left where the search put it.
+COUNTER_MIX_MARGIN = 0.25
+
+#: Per-seat memory of which cohorts counter-mix has already moved, and to what. Same reason as
+#: `_REDIRECTS`: a veto that flickers with the forecast sows half a cohort of each crop.
+_CONTESTED: dict = {}
+
+
+def _opponent_supply(obs, seat: int, day: int) -> dict:
+    """`{product: [(step, units)]}` for the other seat, best source available.
+
+    A fingerprinted `boatlee` is answered from the measured table, discounted to units that settle;
+    anyone else is answered from their standing crops and animals, which are public. Returns `{}`
+    when there is no opponent to read (the harness plays two seats, but a hand-built test state may
+    not have one).
+    """
+    from agent import opponent
+
+    farms = obs.get("farms") or []
+    if len(farms) < 2:
+        return {}
+    known = opponent.locked(seat)
+    if opponent.is_self(known):
+        return {}
+    table = opponent.settled_schedule(known)
+    if table:
+        return table
+    step = day * TURNS_PER_DAY + int(obs.get("hour", 0) or 0)
+    return opponent.forecast_supply(farms[1 - seat], step, None, horizon=LAST_DAY - day + 1)
+
+
+def _window(crop: str, plant_day: int) -> tuple[int, int]:
+    """The step range over which a cohort sown on `plant_day` meets the market.
+
+    From `first_yield_day` to the last day it can still be yielding — `max_yield_day` for a one-shot
+    crop, the end of the season for an ongoing one, because an ongoing crop keeps selling until the
+    buzzer and is therefore exposed to every dump in between.
+    """
+    cd = CROPS[crop]
+    start = plant_day + int(cd["first_yield_day"])
+    end = LAST_DAY if cd["ongoing"] else plant_day + int(cd["max_yield_day"])
+    return start * TURNS_PER_DAY, (min(LAST_DAY, end) + 1) * TURNS_PER_DAY - 1
+
+
+def window_units(crop: str, plant_day: int, supply: dict) -> int:
+    """Opponent units of `crop` landing inside a cohort's harvest window."""
+    lo, hi = _window(crop, plant_day)
+    return sum(int(n) for s, n in supply.get(crop, ()) if lo <= int(s) <= hi)
+
+
+def contest(crop: str, plant_day: int, supply: dict) -> float:
+    """`window_units` as a fraction of the product's `T` — the price curve's own scale."""
+    if crop not in MARKET_PARAMS:
+        return 0.0
+    return window_units(crop, plant_day, supply) / float(MARKET_PARAMS[crop]["T"])
+
+
+def units_per_tile(crop: str) -> int:
+    """Units one tile of `crop` yields over its life. `tile_value`'s numerator, factored out so the
+    counter-mix can also use it to price the supply a *redirect* would itself create."""
+    cd = CROPS[crop]
+    if cd["ongoing"]:
+        return int(cd["max_yield"]) * ONGOING_UNITS_PER_TICK
+    window = int(cd["max_yield_day"]) - (int(cd["max_yield_day"]) + 1) // 2 + 1
+    return min(int(cd["max_yield"]), 1 + window)
+
+
+def contested_tile_value(crop: str, plant_day: int, day: int, proj: "Projection",
+                         supply: dict) -> float:
+    """`tile_value`, but at the price the tile will meet **given who else is selling into it**.
+
+    This is the whole difference between a counter-mix and a threshold. `tile_value` prices a
+    strawberry tile off `Projection`, which reads standing tiles inside a fourteen-day horizon; a
+    cohort sown on day 7 is priced against a board on which the opponent's day-13 strawberry does
+    not exist yet. So the plain valuation ranks STRAWBERRY first every time — measured: on
+    `boatlee_like` vs `boatlee` the threshold flagged both strawberry cohorts at 2.7x and 2.1x of
+    `T` and the value gate then declined every alternative, thirty days running
+    (`counter_mix_stuck` 30, `cohorts_redirected` 0). A veto that never vetoes is not a
+    conservative overlay, it is an unfinished one (E44).
+
+    Priced at `projected inventory + their in-window units`, which **double-counts** whatever part
+    of their supply is already standing and inside the projection's horizon. That is deliberate and
+    it is an over-estimate of the contest, not an under-estimate: the alternative — reconstructing
+    the projection with the opponent's farm removed — costs a second `Projection` per turn to
+    sharpen a number whose decision boundary is `1.25x`, and every product this actually fires on
+    (STRAWBERRY at 2.7x `T`) is far past any correction that could survive. The `contest()`
+    threshold above is computed from `supply` alone and is clean.
+    """
+    ahead = max(0, plant_day + int(CROPS[crop]["first_yield_day"]) - day)
+    inventory = proj.inventory(crop, ahead) + window_units(crop, plant_day, supply)
+    price = float(market_price(crop, int(round(inventory))))
+    return units_per_tile(crop) * price - int(CROPS[crop]["seed"])
+
+
+def _claim(supply: dict, crop: str, cohort) -> None:
+    """Book a cohort's own output into the supply table its neighbours have to sell into.
+
+    Spread over the harvest window, one slot per day, and not parked on the first step: a melon
+    cohort yields across days 17-22, and booking all of it on day 17 makes it invisible to a second
+    cohort whose own window is 20-23. That is not hypothetical — it is what let the first version
+    move **both** contested strawberry cohorts to MELON, 36 tiles of it, which is E41's collapse
+    ("melon fails at *scale*") reached by fleeing a flood into one of our own making.
+    """
+    lo, hi = _window(crop, cohort.plant_day)
+    days = max(1, (hi + 1 - lo) // TURNS_PER_DAY)
+    total = len(cohort.tiles) * units_per_tile(crop)
+    rows = supply.setdefault(crop, [])
+    for k in range(days):
+        rows.append((lo + k * TURNS_PER_DAY, total // days + (1 if k < total % days else 0)))
+
+
+def counter_mix(obs, plan, day: int):
+    """O3's second overlay: keep unplanted cohorts out of markets the opponent is about to flood.
+
+    Only cohorts that have not gone in yet, and only ones whose planned crop is genuinely contested
+    — `contest() >= threshold` — and only when some *other* crop is both uncontested and worth more
+    per tile at the price it will actually meet (`tile_value`, the same valuation `redirect` uses).
+    All three conditions matter: the threshold alone would move boatlee's own shape off strawberry
+    every game, which is a different plan rather than a counter, and `tile_value` alone would ignore
+    the opponent entirely.
+
+    Runs *after* `redirect` and on its output, so the scarcity hunter's choice is vetted by the same
+    test as the plan's: chasing a spike into a market the other farm is about to dump into is
+    exactly the mistake this exists to catch.
+    """
+    if not int(_consts(plan).get("counter_mix", 0) or 0):
+        return plan
+    if not getattr(plan, "cohorts", ()):
+        return plan
+    seat = _seat(obs)
+    supply = _opponent_supply(obs, seat, day)
+    if not supply:
+        return plan
+
+    moved = _CONTESTED.setdefault(seat, {})
+    theta = float(_consts(plan).get("counter_mix_threshold", COUNTER_MIX_THRESHOLD) or 0.0)
+    if theta > 0:
+        proj = for_obs(obs, plan)
+        # The **veto** is judged against the opponent alone — that is what the spec's threshold
+        # means and it keeps the trigger interpretable. The **alternatives** are judged against the
+        # opponent *plus everything we are already growing*, because a market we are about to flood
+        # ourselves is no refuge (E41: melon fails at scale, 60 tiles -> the $1 floor). `ours` is
+        # rebuilt as cohorts are moved, so two contested cohorts cannot both bolt to the same crop.
+        ours = {k: list(v) for k, v in supply.items()}
+        for j, other in enumerate(plan.cohorts):
+            if other.tiles and not other.replant:
+                _claim(ours, moved.get(j, other.crop), other)
+        for i, c in enumerate(plan.cohorts):
+            if i in moved or c.replant or not c.tiles or c.plant_day < day:
+                continue
+            if contest(c.crop, c.plant_day, supply) < theta:
+                continue
+            here = contested_tile_value(c.crop, c.plant_day, day, proj, supply)
+            best, best_value = None, max(here, 0.0) * (1.0 + COUNTER_MIX_MARGIN)
+            for alt in COUNTER_MIX_CROPS:
+                if alt == c.crop:
+                    continue
+                if c.plant_day + int(CROPS[alt]["first_yield_day"]) > LAST_DAY:
+                    continue                # cannot reach a first yield; not an alternative at all
+                if contest(alt, c.plant_day, ours) >= theta:
+                    continue                # out of the frying pan
+                value = contested_tile_value(alt, c.plant_day, day, proj, ours)
+                if value > best_value:
+                    best, best_value = alt, value
+            if best is None:
+                _count(obs, "counter_mix_stuck")
+                continue
+            moved[i] = best
+            _claim(ours, best, c)
+            _count(obs, "cohorts_redirected")
+            _count(obs, "counter_mix_tiles", len(c.tiles))
+            _count(obs, f"counter_mix_from_{c.crop}")
+            _count(obs, f"counter_mix_to_{best}")
+
+    if not moved:
+        return plan
+
+    from dataclasses import replace
+
+    cohorts = tuple(replace(c, crop=moved[i]) if i in moved else c
+                    for i, c in enumerate(plan.cohorts))
+    return replace(plan, cohorts=cohorts)
 
 
 #: How much better the scarce crop has to be before the plan is overridden. A redirect throws away

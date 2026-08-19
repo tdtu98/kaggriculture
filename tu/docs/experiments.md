@@ -4861,3 +4861,445 @@ rather than the numbers of the plan, and the boatlee gap is now demonstrably mat
 Artifacts: R2 vec at `results/s2_r2/state.json -> ['best']['vec']` (gen 38), copy
 `/private/tmp/r2_cand_vec.json`; raw decisive results `/private/tmp/decisive_all.json`.
 **Nothing promoted.**
+
+## E78 — O2: boatlee is a choreography down to its sell steps; fingerprint locks at 48 with zero false positives
+
+**Build.** `agent/opponent.py` (315 lines): `census` / `distance` / `fingerprint` /
+`forecast_supply` / `sell_schedule`, plus the measured tables `PROFILES`, `SELL_SCHEDULE`,
+`CONDITIONAL_SELLS`, `SETTLE_RATE`. `projection.py`'s `_farm_supply` was made public and reused
+rather than re-derived — **one forecaster** (the E39 rule: a comparison run against a
+re-implementation of the rule measures the re-implementation). The hook is passive:
+`_watch_opponent` in `agent/main_v4.py` (`:125`, `:166-207`), inside its own `try`, stashing
+`opp_known` / `opp_forecast` on the agent state for O3 to consume. Nothing reads them yet.
+
+**The env premise, cited.** Farms are `shared: true` (`kaggriculture.py:261,271,952`) — the
+opponent's tiles, `planted_day`, animals and money are visible **every turn**. What is private is
+`shared: false` (`:269`): shed and unit inventories. Market orders are invisible entirely. So the
+tile census and the harvest forecast are *free*; the sell schedule is the part that had to be
+**measured**, and that asymmetry is the whole shape of O2.
+
+**Census.** 15 features — 5 crops, 3 animals, pasture count, unlocked quads, hands — under L1
+distance. **Weeds and empty tiles are excluded**: over 70 observations per checkpoint they were the
+only features that moved with the RNG, and including them dissolves the signal. Measured spreads:
+**boatlee 0 across all 70 observations**; our own plans ≤ 2; nearest boatlee↔other distance **6**.
+`THRESHOLD = 2` sits 2 above the noise and 4 below the signal. Lock requires **≥2 checkpoints with
+exactly one survivor**, and is re-tested at each later checkpoint so it can be dropped.
+
+**Verification** (fresh block 66200:66240, 80 games, both seats). boatlee locks **100% (80/80) at
+step 48** — the bar was ≥95% by step 72. **Zero false positives**: 80 vs `starter`, 80 vs
+`executor_v7`, 160 vs our own plans (compiler / R1 / R2). The self-recognition case is the
+interesting one: R1 and R2 are 0-1 apart in census, so the observer **declines to lock between
+them** and holds unknown — intended, and the reason the survivor-count rule is "exactly one" rather
+than "nearest". The hard separation is herd timing: boatlee has **4 sheep + 1 cow + 5 pastures at
+step 24** where every plan of ours has zero animals.
+
+**The headline: boatlee's sell schedule is byte-identical across seeds *and* across opponents** —
+the same steps and the same quantities. Measured through the env's `_commit_unit`
+(`kaggriculture.py:664`), so these are **settled units, not orders**:
+
+| product | settled | steps |
+|---|---|---|
+| WHEAT | 439 | 37 |
+| STRAWBERRY | 285 | 19 |
+| MELON | 114 | 16 |
+| MILK | **209 settled of 241 ordered** | 32 |
+| FERTILIZER | 223 | 48 |
+| WOOL | 145 | 18 (+6 conditional) |
+
+Milk is the **order-is-not-a-sale rule in the flesh** — 241 requested, 209 arrived; `SETTLE_RATE`
+carries that discount so O3 front-runs the *real* volume. The 6 conditional wool steps fire on
+**3 of 10 seeds** (boatlee's relay overlay); they are parked in `CONDITIONAL_SELLS` and deliberately
+not scheduled against — **never front-run a coin flip**.
+
+**Cost and passivity.** `fingerprint` + `forecast` mean **35 µs**, p99 **60 µs**, against a 5 ms
+bar; per-turn p99 unchanged (**17.04 ms** with the hook vs **16.88 ms** without). Passivity is
+**proven, not asserted**: hook against a no-op stub, money **identical** on 10 paired seeds in both
+seats.
+
+**Suite 758 passed; `make verify` 0 divergences.** The mutation checks include two **staleness
+tripwires** that re-derive the tables from live games, so a boatlee revision breaks the build rather
+than silently poisoning O3. **[LESSON]** the first version of the fingerprint test read the *final*
+board for all three checkpoints and thereby refuted a fingerprint that in fact worked — E44's
+"prove the change fired" in its inverse form, where a test bug manufactures a negative result.
+Snapshot-at-step discipline is now documented in the test.
+
+**Note for L1**: `tools/build_submission.py` must bundle `agent/opponent.py` **and**
+`agent/projection.py` once the compiler becomes the submission.
+
+**Verdict: O2 done.** The fingerprint exceeds its bar (100% at step 48, 0 FP in 320 games) and the
+sell schedule turned out to be a *table*, not a distribution — which is the single most useful fact
+Track O could have produced, because it means O3's front-run has an exact target rather than a
+forecast. **O3 consumes `st["opp_known"]` and `st["opp_forecast"]`.**
+
+## E79 — O3: front-run and counter-mix refuted with mechanisms; slot alignment is the one that works
+
+**Env mechanics, cited.** `_commit_unit` adds **1 unit at a time** to market inventory and the price
+is **re-quoted per unit inside the same `while` loop** (`kaggriculture.py:659-660`, `:597`) — so a
+dump walks its own price down. Thin markets cliff: STRAWBERRY (`T=100`) a 34-unit dump takes
+$120 → **$55**; MILK $160 → **$116**. Order interleaving is the load-bearing part: the outer loop is
+over **order index `i`** (`:563`), slot `i` is drained for **both** players against the *same*
+pre-commit inventory (`:612-618`) before `_refresh_prices` (`:628`). **There is no seat advantage;
+there is a real slot advantage.** Measured **17 same-step same-product collisions per season**, and
+we sat in the later slot on **11** of them.
+
+**Implementation.** Three overlays behind `plan.consts` flags (`frontrun`, `counter_mix`,
+`slot_align`), default **0**, **byte-identical when clear** (tested). Front-run suspends the sell
+floor, with the alternative (`keep_floor`) also measured. `_hoist` runs **after** truncation so it
+cannot evict a buy. Wired through `Plan.with_consts` + registry `const_name`
+(`compiler#slot_align=1`). Two **E44-shape** bugs found and fixed: `projection._CONTESTED` was not
+reset between games in one worker (a never-firing change wearing live counters — caught by a
+two-games-one-process test); and `_flag(...) or default` turned `lead=0` into 10.
+
+**[REFUTED] Front-run** (80 paired games/arm, 67000:67040): compiler **+$250** [−1,193, +1,694];
+R1 **−$2,274** [−2,729, −1,818]; R2 **−$1,979** [−2,279, −1,678]. `keep_floor` does not rescue it.
+The lead sweep on R2 is **monotone**: 6 → −$537, 15 → −$1,979, 24 → −$2,192 — the optimum is
+**lead → 0**. **Mechanism**: realised $/unit **falls** in every front-run product (MILK 180 → 175,
+STRAWBERRY 175 → 168, TOMATO 108 → 100). We are the marginal seller either way, and the market
+recovers by **draining** (~6/day/shop-instance + centre), so an hour held is an hour of price
+recovery, while selling early meets inventory our own units have not drained yet. **Reusable claim:
+against a thin, drain-recovering market, timing a sale *earlier* is a cost; the exploitable
+asymmetry against a script is ordering WITHIN a step.**
+
+**Slot alignment works.** R1 **+$367** [+251, +483] and R2 **+$286** [+7, +565] on 67000:67040;
+held-out 68000:68040 R1 **+$562** [+432, +692] (75/80), R2 **+$533** [+447, +620] (**80/80**); null
+on the incumbent (variance 10×). `sells_reslotted` ~15/game. It is a **pure permutation
+post-truncation** and therefore cannot cost a buy.
+
+**[REFUTED] Counter-mix**: compiler **−$11,855** [−15,704, −8,007], R2 **−$2,426** [−3,858, −994]
+vs boatlee; **inert vs starter**, so the "≤3% solo" bar passes **vacuously**. This is the **third**
+confirmation of E76/E77's denial finding: **ceding strawberry to boatlee is worth more to them than
+the substitute is to us.** Implementation notes for the record: the naive value gate **never fired**
+(it priced against a board where their supply did not exist yet); `contested_tile_value` fixed it;
+and the first firing version rebuilt **E41's melon collapse by hand** (36 tiles) until `_claim`
+spread per-day and counted our own cohorts.
+
+**Guardrails.** Suite **783**, `make verify` **0** divergences, p99 **17.5 / 15.2 ms**, fallbacks
+**0**, every mutant caught by exactly one test.
+
+**Verdict: O3 done. Recommendation recorded — O4 gates `slot_align` only.**
+
+## E80 — O1: branches work and are free when dormant; every verdict is plan-scoped
+
+**Shop table, from `SHOPS` (`kaggriculture.py:103-112`).** The single-product ×2-drain shops are
+**YARN_STORE = WOOL** and **PET_CAFE = CARROT** — this **corrects the task text**, which had
+PET_CAFE as eggs; there is **no goose branch** and the arithmetic behind one does not exist.
+Demander counts: WOOL 1, MILK 3, STRAWBERRY 4, WHEAT 5.
+
+**Shop draws are state-dependent, not seed-pure.** `_end_of_day` seeds `Random((seed*1_000_003)^day)`
+and then `_spawn_weeds` consumes a **play-dependent** number of draws before
+`rng.choice(sorted(SHOPS))` (`:875`, `:877`, `:891`, `:839`) — the same 200 seeds with seats swapped
+give identical shop sequences in only **32/200** games. Rarity over 400 games: yarn by d15 **49.8%**,
+≥2 strawberry shops by d9 **49.2%**, no-milk by d12 **15.2%**.
+
+**Implementation.** `agent/branches.py` (540 lines): a condition mini-language, a purchase frontier,
+and `forward_only` **enforced by construction** plus a hostile-op gate test. `Branch` gains `day_to`
+(windows must **close** — instance counts only grow) and `name`. A one-line hook sits ahead of dawn
+and the hour-1 compile so patches flow through `_paced_plan` normally. `branch_rejected` is counted
+**separately** so a rejection can never read as a firing.
+
+**Tuning** (90000:90200, 400 games/arm): `yarn_sheep` count **2** (+$2,311; 4 is identical — the
+frontier exposes only ~2 unbought cows); `straw_cohort` day **12** / **3 shops** (+$3,136);
+`milk_cap` **9/7** best of a null sweep (+$1,496, CI straddles). Structural: branch `tiles=3.0`
+always for boatlee_like (quadrants are fully claimed, so `tiles=10` fires **0/400**), and capping at
+d15 drops nothing (the herd is already bought).
+
+**Gate** (fresh 91000:91300; the combined arm on a **second** fresh block 93000:93300, per E43):
+**2,321 dormant games byte-identical across all arms.** Per-branch on the compiler: yarn **+$4,224**
+[+2,342, +6,106] vs boatlee ✓; straw **+$3,039** [+1,364, +4,715] solo ✓; milk_cap **+$3,286**
+[+1,504, +5,067] vs boatlee ✓ — and **each fails on the other opponent**, i.e. plan-*and*-opponent
+scoped. Combined on the compiler: solo **+$2,845** [+1,723, +3,968] on 447 true games; vs boatlee
+**+$2,056** [+629, +3,484]; **winrate vs boatlee unchanged at 0%**.
+
+**[The finding] Every branch verdict is a property of the PLAN.** On R1 the herd branches **never
+fire** (`animals_per_day=4` swallows the frontier before the windows open) and `straw_cohort` is
+**−$2,860** [−4,178, −1,542] — 3 free tiles is a top-up, 6 is a flood (**D17 against E48, exactly**).
+`branch_set=all` is recommended for the **incumbent compiler only**, and it is kept as a `consts`
+flag **rather than a gene** so it stays re-measurable per genome.
+
+**Guardrails.** Suite **819** (+36), `make verify` **0**, **11/11** mutants (including the
+hostile-op boundary test the first mutant survived long enough to force), effects proven from a
+board census + the env sales ledger **not orders**, `apply()` **11 µs** steady / **229 µs** on a
+patch turn.
+
+**Verdict: O1 done.**
+
+## E81 — O4: the operational gate passes, the boatlee bar fails 0/80 everywhere; champion = R2 + slot_align
+
+**Design.** 8 arms vs boatlee, **80 games each, both seats**, on a fresh block **70000:70040**
+(freshness verified — unused by any search or prior gate), with the whole matrix **replicated** on
+**71000:71040**. Arms: incumbent compiler plain / +branch_set / +slot / +branch+slot, R1 plain /
++slot, R2 plain / +slot / +slot+branch. Paired same-seed differencing throughout. 1,440+ games
+appended to `results/games.jsonl`.
+
+**[The bar fails] Every arm is 0/80 on both blocks** — Wilson [0%, 4.6%]. The gate asks for ≥80%.
+Margins vs boatlee: incumbent plain **−$84,037**; incumbent+branch+slot **−$82,733**; R1 plain
+**−$63,124**; R1+slot **−$62,031**; R2 plain **−$60,764**; **R2+slot −$60,009**. The overlays are
+worth **~$1k against a ~$60k gap**. Track O therefore *confirms* E77/E80's structural picture rather
+than overturning it: the deficit is in the choreography, not in market timing.
+
+**[The overlays that replicate] Slot alignment, on both plans, on both blocks.** Paired deltas:
+R1+slot **+$1,093** [+904, +1,283] / **+$1,054** [+848, +1,259]; R2+slot **+$755** [+659, +851] /
+**+$937** [+812, +1,063]. Both replicate with CIs clear of zero — E79's held-out finding survives a
+third and fourth block. `sells_reslotted` **14.5–16.1/game** in every slot arm (E79 ~15), so no
+zero-counter breakage. On the incumbent, +branch+slot is **+$1,304 [−590, +3,199]** — null, E79's
+**10× variance** on the incumbent holds.
+
+**[Marginal false positive] `branch_set` on R1 does not replicate.** Block 1 **+$1,237**
+[+259, +2,215]; block 2 **−$438** [−977, +101]. Sign flips, CIs barely overlap zero on either side.
+**Branches stay OFF on R1.** E80's direction transfers, its magnitude does not — exactly the
+E37/E39/E42 pattern, caught only because the matrix was replicated on a second block.
+
+**[Provably inert] `branch_set` on R2 is bit-for-bit identical to R2+slot** on both blocks. This is
+*not* a silent no-op wearing live counters (E44): `branch_noop` runs **1.2/game**, i.e. the machinery
+evaluates its conditions and declines. R2's own herd/cohort pacing swallows every frontier the
+branches would patch — the E80 finding ("every branch verdict is a property of the PLAN") in its
+strongest form.
+
+**R2 > R1 confirmed.** R2−R1, both with slot: **+$2,022** [−679, +4,723] / **+$2,645**
+[+674, +4,616]. Directionally consistent, significant on the second block.
+
+**[Operational gate: PASS] Pool and solo show EXACT equality, not statistical.** Champion vs plain,
+same seeds: flooder 97.5% at +$22.7k, tomato_rusher 100% at +$124.1k, executor_v7 100% at +$64.6k,
+starter solo **$122,222** — identical numbers, not merely overlapping CIs. **Structural reason**:
+`_slot_align_targets` (`agent/main_v4.py:342-354`) returns an empty target set unless the opponent
+fingerprint is **locked and not ourselves**, so the overlay literally cannot execute against a
+non-boatlee opponent. `slot_align` is free solo **by construction and by measurement**. The cost of
+the choice is forgoing branches' +$2.8k, which is **incumbent-only and inert on R2** — i.e. no cost.
+
+**Latency.** R2+slot vs boatlee through the **reference** env, 4,308 turns measured at the
+`__get_shared_state` boundary: p50 **0.009 ms**, p95 **1.86**, p99 **15.8**, max **30.5** — **6×
+inside** the 100 ms budget. Guards clean: fallbacks **0**, thirst **0.5–3.2**, steps/useful
+**0.71–0.78**.
+
+**[Champion, and the L1 candidate] R2 + `slot_align=1`.** R2 = the 80-gene round-2 vector
+(`results/s2_r2/state.json['best']['vec']`, copy `/private/tmp/r2_cand_vec.json`);
+`branch_set` / `frontrun` / `counter_mix` **OFF**. Registry: `const_name(vec_name(vec), slot_align=1)`.
+Runner-up R1+slot. **Caveat recorded with the promotion**: this is the best available agent, not a
+competitive one — **0/160 vs boatlee across both blocks**.
+
+**Verdict: the original ≥80%-vs-boatlee bar FAILS; the operational bar PASSES** (champion
+replicated on an independent block, overlays live with non-zero counters, zero pool/solo regression,
+latency 6× inside budget). **O4 done; Track O closed.** The remaining routes to the boatlee bar lie
+outside the compiler line.
+
+## E82 — P1: the season model is mechanically ~5% accurate; the day-8 error is the undrawn shops; ranking survives, so P2 proceeds
+
+**Why there is a P-track at all.** E81 closed Track O with the boatlee bar failing 0/80 in every
+arm and the deficit diagnosed as **staging**: a fixed genome schedule commits to one cash-flow
+story before the game starts, while boatlee's choreography compounds stages. Nothing in the
+compiler line can re-stage per game. P1 builds the model a dawn planner would search over; P2 is
+that planner; P3 distils it only if we turn out to be CPU-bound. kagsim stays **offline-only** — the
+in-submission model composes `agent/forward.py` + `agent/projection.py` + `agent/opponent.py`.
+
+**Built.** `agent/season.py`, 1,015 lines, submission-legal import surface (stdlib + our own
+modules). `SeasonState.from_obs` (`:235`), `step_day` (`:944`), `rollout` / `rollout_from_obs`
+(`:989` / `:1011`). `DayDecisions` (`:170`) **is P2's action space**; `shops_on` / `future_shops`
+(`:332`) **is the draw-scenario seam**. Market pricing is the exact fast path with the amplitude
+hoisted (`:379-433`), pinned equal to the env curve over the whole range and rebuilt whenever
+`MARKET_PARAMS` changes. **Nothing was re-derived** (E39's rule): plant and animal ageing run
+through `forward.FarmModel._daily_refresh_*`; drains through `projection.drain_per_day` — lifted
+out of `Projection._drain`, which now delegates to it and is paired-tested **byte-identical on 10
+seeds**; opponent supply through `opponent.forecast_supply` (`SELL_SCHEDULE` × `SETTLE_RATE`,
+`CONDITIONAL_SELLS` excluded, per E78's "never front-run a coin flip").
+
+**Assumptions, all docstring'd rather than buried**: watering is assumed satisfied and charged to a
+scalar labour budget (hands × 13 ops, from the measured steps/useful of 0.75); hiring is
+demand-driven; daily sells honour the floors and `release_pressure`; terminal liquidation at d29;
+undrawn shops enter at expectation; per-product execution-loss scalars fitted on a **SPENT** block
+(72500) — of which **only STRAWBERRY 0.90 binds**, corroborated by C5's measured 6.77 against a
+theoretical 8.
+
+**Four structural bugs the fidelity iteration found**, each of which the money alone would never
+have named: empty pastures read as **occupied** (`{"kind": "PASTURE"}` is not `None` — WOOL came
+out 0.37× actual); the shed cap applied to **flow** instead of dusk **stock** (136 phantom
+discards/game); one-shot crops harvested at `first_yield_day` instead of `max_yield_day`
+(wheat/melon half-size); and seedlings left unwatered on their plant day, so
+`consecutive_unwatered` started at 1 and **every new plant died**.
+
+**Fidelity gate** (80 games, 72000:72009, both seats, settled money, delivered observations —
+absolute mean error on end-of-season bank projected from day *d*): day 3 **19.7%** · day 8
+**13.5% FAIL** (bar ≤10) · day 15 **8.4% PASS** · day 22 **5.6% PASS**. Split by opponent it passes
+against `starter` from day 8 (**9.4%**) and fails against boatlee (21.4% at day 8, 14.4% at day 22).
+The kill criterion (>20% after one fix round) **does not fire**.
+
+**[The decisive ablation] Substitute the true shop draw and the day-8 error goes 13.5% → 5.4%**
+(vs boatlee 20.6% → **6.2%**). So the **mechanics are ~5% accurate** and essentially all of the
+residual is the **6-of-8 undrawn shop instances** acting on thin curves — STRAWBERRY `T=100`,
+MILK 122, WOOL 105 (E79's cliff products, again). Realised $/unit lands 2-5× off in **both**
+directions while the volumes stay within ~25%: the model gets the farm right and the price wrong,
+because it does not know which shops will exist. This is a **common shock across same-dawn
+candidates**, which is exactly the property a planner needs: **ranking survives** — Spearman
+**+0.85 / +0.94 / +0.97** at days 8 / 15 / 22.
+
+**Latency.** `rollout` median **2.22 ms** at day 3 (max 2.81), **0.86 ms** at day 22; `from_obs`
+**0.065 ms** — inside the 5 ms bar, and P2 needs thousands of rollouts per dawn. Two optimisations
+took it from 8-10 ms: **one board scan per day** instead of per-product, and the **amp-hoisted**
+price function.
+
+**Prescriptions for P2, recorded so they are citable.** (1) **Rank, do not trust absolutes** — the
+gate says the ordering is sound and the level is not. (2) **Average over sampled draws** via
+`future_shops` rather than planning against the expectation. (3) **Do not search before day ~6**;
+the day-3 error is 19.7% and the board is not yet informative. Two known under-predictions are
+**deliberately not papered over with >1 multipliers**, because a multiplier would reward P2 for
+choices that do not pay: wheat surplus never sold (27×, ~$1k) and day-21 tomato ground not refilled
+(3.4×, ~$1.3k vs boatlee). They are model *pessimism* about actions we do not currently take.
+
+**Guardrails.** Suite **847 passed / 1 skipped / 1 xfailed** (+28 in `tests/test_season.py`,
+including E44-shape decision-hook money assertions and a mutation check that `max_yield` 4→1 must
+blow the fidelity up — it does). `make verify` **0 divergences**.
+
+**Verdict: P1 done. The gate fails at day 8 on undrawn shops, not on mechanics, and the ranking
+correlation is what P2 actually consumes — P2 proceeds, on a relative objective.**
+
+## E83 — P2: the dawn planner is killed, harder than the criterion asked — its one live decision type is priced by a model that structurally cannot price it
+
+**Built, and shipped OFF.** `agent/planner.py`, **748 lines**: candidate menu (`:236`), search
+(`:487`, screen → evaluate → deepen → confirm), apply (`:668`, mirroring `branches.apply`), and
+`_forward_only` (`:395`) reusing O1's gate with exactly one widening — **un-owned land may be
+re-timed**. `main_v4.py` gains **3 lines** (import, per-game reset, hook placed **after O1 and
+before `_dawn`** so an hour-0 land decision still reaches that turn's `BUY_LAND`). Knobs live in
+`plan.consts`. Default OFF and **byte-identical when off**, proven three ways: plan object
+**identity** preserved, planner counters **empty**, and 10 paired seeds against a **hookless** build.
+
+**Candidates are patched `Plan`s, not `DayDecisions`.** One representation that `rollout()`
+evaluates and the shell executes. A `DayDecisions` winner would have been unplayable — **E44 in its
+purest form**, designed out rather than debugged later.
+
+**Measured design choices** (each bought by an experiment, not assumed). **K = 4 shop draws**:
+top-1 agreement with a 32-draw reference is **91.1%**, and K=8 buys nothing. **Lookahead ships at
+1**: the depth-2 mix of single-draw maxima against depth-1 averages manufactured a **+$10,550
+phantom** for a move the 32-draw reference ranked *below* follow — classic winner's-curse bias,
+fixed by making depth all-or-nothing. **Direction locks** stopped churn (one cohort moved
++2/+1/−2 on consecutive days; **11 deviations/season → ~4**). A held-out confirmation sample
+(`CONFIRM_SALT`) debiases the reported gain.
+
+**Latency is a non-issue.** p99 **56 ms** ON vs **16.7 ms** OFF over 2,157 reference-env turns —
+and `actTimeout` is actually **1 s**, i.e. **11× headroom**. P2 was never CPU-bound, which is
+already most of P3's answer.
+
+**[The result] 80 paired games/arm, both seats, on R2+slot_align.** Solo **−$5,984**
+[−8,909, −3,058] on 74000:74040, **replicated −$4,706** [−7,803, −1,609] on 75000:75040. Margin vs
+boatlee **−$4,546** [−6,594, −2,499] / **−$4,287** [−6,809, −1,764]. Winrate **0/80 unchanged**.
+**Boatlee's own money RISES $2.7–3.1k when we deviate.** On the incumbent compiler instead of R2,
+solo **−$6,255** — the loss is not an R2 artifact.
+
+**Attribution: one decision type carries the entire loss.** `cohort_shift` **−$5,641**
+[−9,962, −1,320]. `land` **+$154** and `herd` **+$268** are null at **~0.2 fires/game**. `cohort`
+and `wheat_ramp` fire **ZERO** times — R2 claims every tile and its cash gates SE until day 16
+(**E80's plan-scoping, again**). Without `cohort_shift`: **−$1,389** [−2,931, +153] — nothing left.
+
+**[The mechanism] Calibration in play, 1 move/season over 20 seasons: predicted +$1,657 mean,
+realised −$4,393, correlation −0.15, sign agreement 4/20.** Realised outcomes are **bimodal**:
+either **$0** or **−$10k…−$27k**. Worked example — shifting a 5-tile strawberry cohort 3 days:
+thirst **2 → 9**, `fertilize_hits` **52 → 43**, `prune_days` **7 → 10**, straw/plant **6.33 → 4.73**,
+melon **120 → 78**. The shift **re-phases the day and collides with the router's existing
+schedule**, so the entire cost lives in the two assumptions `season.py` explicitly declared
+out-of-scope: **watering assumed satisfied**, and **labour as a scalar**. The search is **not
+mis-ranking noise — it ranks a quantity the model does not contain.**
+
+**Guardrails.** Suite **864 passed** (+17), `make verify` **0 divergences**, fallbacks **0**,
+`planner_errors` **0**, **11/11 mutants caught**. Two mutants survived the first pass and forced
+better tests: a flag-off invariance test that was comparing **mutated against mutated**, and a value
+mutant that **averaged one draw over four**.
+
+**Verdict: P2 is killed, harder than the bar asked.** The kill criterion was *CI includes zero*;
+what came back is **CI below zero, replicated on two blocks**. Two follow-ups are implied and both
+are recorded as **expensive and uncertain — neither is "more P2"**: (1) pricing cohort timing at all
+requires a **router-granular rollout**, a much larger build than P1; (2) the decisions the current
+model *can* price are **inert on R2 specifically**, so re-measuring them needs a **slack genome**,
+which contradicts the very tightness that makes R2 win. Champion **unchanged (R2 + `slot_align`)**.
+
+**[LESSON] A planner is only as good as what its value model contains.** Assumptions that are safe
+for *prediction* can be fatal for *optimization*, because a search **steers into the model's blind
+spots** — P1's ~5% mechanical accuracy (E82) was real and still insufficient, since the objective
+was maximised exactly where the scalar-labour assumption breaks. Chain: E76 → E77 (fitness noise),
+E80 (plan-scoping), E82 (model scope), **E83 (model scope becomes an adversary under search)**.
+
+**Artifacts.** `/private/tmp/p2/` (scripts + raw deltas); the verdict is also carried in
+`agent/planner.py`'s module docstring.
+
+## E84 — P2b: compiler-in-the-loop rollouts, killed at Gate 1 — no self-consistent forward simulation can price cohort timing, because the priced quantity is the simulation-reality gap itself
+
+**Why P2b existed.** E83 killed P2 with a named follow-up: pricing `cohort_shift` requires a
+**router-granular rollout**, because the cost lands in exactly the two things `season.py` declared
+out of scope (watering satisfied, labour as a scalar). P2b is that build — the fine-grained version
+of P1's value model, with the real compiler in the loop — gated by E83's own calibration protocol
+before any money was spent.
+
+**Built.** `agent/true_rollout.py`, **575 lines**. `step_day` (`:336`) mirrors `main_v4._act`: town
+drain → a **full dawn market turn** (paced plan, land, hires, `verify._afford` seed and product
+buys, `_animal_orders`, `_dispatch` over the ten-slot queue, sells) → `verify.compile_day` at hour 1
+→ the **compiled script played turn-by-turn** on `forward.FarmModel` with all three sell hooks live.
+`planner.py` gains `planner_value` / `"true"` and `planner_true_days`; `season.py`'s `_sell_day`
+gains an optional products filter defaulting to P1 behaviour. `_sandbox` (`:79`) isolates every
+module-level piece of state. Menu, beam, direction locks and the confirmation sample are **reused
+from P2 untouched**, so the only variable changed is the value model. `tests/test_true_rollout.py`, 16 tests.
+
+**An E44-shape bug mid-build, worth recording.** The sandbox swapped in an **empty**
+`main_v4._STATE`, which took the season-reset branch and wiped `planner._SEASON` — so 11 deviations
+were committed while `planner.log()` returned `()`. The first calibration run was invalidated by it.
+Pinned by `test_rollout_does_not_reset_the_planners_season`.
+
+**What it contains for real:** routing, thirst, blocked ops, C3 pruning, tick-day watering, seed
+affordability, the ten-slot dawn queue, wages and costs, the shed cap. **What it omits, docstring'd
+rather than buried:** weeds (0.005/tile/day ≈ 3.6/season, measured negligible), a frozen opponent
+board, sampled draws, a crew-size op-count proxy (10 ops/hand, fitted against `decide_hands` over 90
+dawns: **MAE 0.51, within-1 92%**), and a dawn-lumped town drain.
+
+**Cost.** Rollout **95 → 25 ms** across the season; dawn **180–390 ms** at `planner_true_days=10`
+against the real **1 s** `actTimeout`. Sanity fidelity beats the fast model at every checkpoint:
+**8.4 / 5.5 / 3.6%** vs **10.1 / 9.0 / 8.1%** at days 8 / 15 / 22.
+
+**[The result] Gate 1 FAILS.** E83's protocol exactly — 1 forced move/season, paired, fresh
+**76000:76010**. vs `starter`: correlation **+0.312**, sign agreement **9/20**. vs boatlee:
+**+0.042**, **8/20**. The bar was **≥ +0.4 AND ≥ 60%**. Against E83's fast model (−0.15, 4/20) the
+correlation **flips positive and sign agreement doubles** — a real improvement, and nowhere near
+enough. Realised deltas stay **bimodal** (−$20k…−$28k or ~$0) while the model prices **+$1.7–6.7k**.
+
+**The worked example is fixed and the calibration still is not.** E83's −$16,200 five-tile
+strawberry shift re-prices **+$2,446 (fast) → −$5,534 (true)** — pinned as a test. But re-scored
+over E83's **full 20-move set**: correlation **−0.610**, sign agreement **11/20**. The false
+positives were traded for **false negatives** (74009 seat 0: predicted −$14,526, realised
+**+$16,268**). **Fixing the named case is not calibrating.**
+
+**[The decisive ablation] The market is exonerated.** The same 20 moves re-priced under **K=1**,
+**K=8 sampled draws**, and with the **TRUE shop draw substituted**: correlation **+0.297 / +0.291 /
++0.317**. The substitution that took P1's day-8 error 13.5% → 5.4% (E82) **buys nothing here**.
+Weeds are ruled out by arithmetic and opponent-supply divergence is exonerated by the frozen board.
+The residual is **on the farm, with the real router already in the loop.**
+
+**[The mechanism — the finding] The rollout contains the router's *plan* for each day but not its
+*failure to execute* it.** An imagined day, C3-certified, executes exactly as compiled:
+`blocked_ops` **0–2 per simulated season** against **≈39/game real**. A re-phased cohort is
+precisely where compiled-vs-played divergence compounds — counter diff, seed 76003 seat 1,
+`cohort0_+4`: realised strawberry units **174 → 117** and `fertilize_hits` **53 → 39**, while the
+rollout showed units **167 → 147** and fertilizer **UP**. **Rolling out through C3 inherits C3's
+blind spots along with its arithmetic.** Secondary: the crew proxy absorbs a collided day by hiring,
+where the real dawn loses hires to the ten-slot queue.
+
+**Gate 2 was not run**, per the criterion — no money was measured, so no money is claimed.
+
+**Guardrails.** Suite **880 passed** (+16), `make verify` **0 divergences**, `rollout_errors` /
+fallbacks / `planner_errors` all **0**, flag-off **byte-identity**, **8/8 mutants** caught. Two
+forced better tests: per-hook sell counters, and a test that asserted a *helper's return value*
+instead of the call site — CLAUDE.md's exact warning, in the flesh.
+
+**Verdict: killed at Gate 1.** No self-consistent forward simulation can price `cohort_shift`,
+because **the quantity being priced is the gap between the compiled day and the played day, and any
+rollout built from our own compiler closes that gap by construction.** This is not "the model was
+too coarse" — P2b **is** the fine-grained version, and the market half is ablation-exonerated.
+Pricing this needs the divergence **itself**: the full env with true RNG and a live opponent
+(`kagsim` — **not importable in-submission**), or a residual learned from **PLAYED** games rather
+than simulated ones. **Cohort timing is not searchable by this line.** Champion **unchanged
+(R2 + `slot_align`)**; everything ships **OFF twice over** (`planner=0` **and**
+`planner_value="fast"`).
+
+**[LESSON, sharpening E83] E83 said a planner is only as good as what its value model contains.
+E84 sharpens it: some quantities cannot be put into a value model at all, when the quantity IS the
+model's own error.** Making the simulator finer is the wrong axis — a simulator that agrees with
+itself is exactly the thing that cannot measure its own disagreement with reality. Chain: E76 → E77
+→ E80 → E82 → E83 (model scope becomes an adversary under search) → **E84 (self-consistency becomes
+the blind spot)**.
+
+**Remaining routes.** Self-play RL, where values come from **played** games and this failure mode
+cannot occur by construction; clone/BC, provenance-gated; or ship the champion via L1.

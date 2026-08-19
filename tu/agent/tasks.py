@@ -261,6 +261,10 @@ def daily_tasks(obs, plan, day: int | None = None, turn: int = 0, price_fn=None)
         from agent import projection
 
         plan = projection.redirect(obs, plan, day)
+        # O3 counter-mix, on the redirect's output and for the same reason it lives here: this is
+        # the one place both the PLANT tasks and the dawn BUY_SEED list are derived from, so a
+        # cohort steered off a contested crop cannot leave dawn buying the seed it no longer sows.
+        plan = projection.counter_mix(obs, plan, day)
     except Exception:
         pass
     price = price_fn or make_price_fn(obs, plan)

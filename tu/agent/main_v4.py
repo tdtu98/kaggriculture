@@ -20,6 +20,9 @@ to PASS, and the fallbacks are counted so a silent failure cannot masquerade as 
 
 from __future__ import annotations
 
+from agent import branches as branch_points
+from agent import planner as season_planner
+from agent import opponent
 from agent.plan import LAND_ORDER, NEVER, Plan
 from agent.tasks import SHED_TILES, current_prices, daily_tasks, market_needs
 from agent.router import HIRE_COST, decide_hands
@@ -43,6 +46,56 @@ BASE_PRICE = {"WHEAT": 25, "CARROT": 35, "TOMATO": 60, "STRAWBERRY": 120, "MELON
 #: From this step, liquidate: unsold stock is worth nothing at the buzzer.
 TERMINAL_STEP = 700
 
+# --------------------------------------------------------------------------- O3 overlays
+#
+# Three overlays on the market and the plan, each behind its own `plan.consts` flag, each with its
+# own effect counter, all three **off by default** so the incumbent genomes are byte-identical
+# without them (E43: measured alone first, together in O4).
+#
+# What the env actually does, because both overlays are priced off it
+# (`kaggle_environments/envs/kaggriculture/kaggriculture.py`, verified line by line, and
+# `kagsim/src/market.rs:291-361`, which is the same loop):
+#
+# * **A sale moves the price, one unit at a time.** `_commit_unit` adds **1** to
+#   `market["inventory"][item]` per unit sold (`:660`) and the *next* unit is re-quoted at the new
+#   inventory inside the same while-loop (`:597`). `market_price` falls as inventory rises above
+#   `I0` with the product's `above_func` (`:192-206`), and the thin markets fall off a cliff:
+#   STRAWBERRY has `T = 100` and `above_target = 1.60`, so boatlee's 34-unit dump at step 528 takes
+#   a $120 quote to **$55** (measured, `/private/tmp/o3/probe_hold.py`). MILK (`T = 122`) goes
+#   $160 -> $116 on its 21-unit dump at 406. Selling *before* that is the entire front-run.
+# * **Orders are processed slot-by-slot, in lockstep across the two players.** The outer loop of
+#   `_process_market` runs over the **order index** `i` (`:563`), drains slot `i` for *both* players
+#   to exhaustion in an inner loop, and only then calls `_refresh_prices` (`:628`) and moves to slot
+#   `i+1`. Within one slot both players are quoted at the same pre-commit inventory (`:612-618`), so
+#   seat order buys nothing there — but a sell in slot 0 is fully executed against a virgin
+#   inventory before a slot-2 sell of the same product is quoted at all. Slot index, not seat, is
+#   the priority. That is what `slot_align` exploits.
+
+#: `frontrun_lead` is a gene with range 0-24; a lead of 0-5 cannot straddle a dump usefully at 24
+#: turns a day and 24 is a whole day of shed. Clamped rather than re-ranged so old genomes decode.
+FRONTRUN_LEAD_MIN = 6
+FRONTRUN_LEAD_MAX = 24
+
+#: Dumps smaller than this are not worth emptying a shed for. Boatlee's milk table has 3-unit
+#: dribbles next to 21-unit drops and its wheat table has 1-unit ones; a 3-unit milk sale moves the
+#: quote by under 4% while the shed we dumped to get ahead of it was worth the full spread.
+FRONTRUN_MIN_UNITS = 8
+
+#: How far a *forecast* dump (unknown opponent, supply read off their tiles) is smeared, in turns.
+#: One day either side — the spec's "±1 day".
+FRONTRUN_FORECAST_SPREAD = TURNS_PER_DAY
+
+
+def _flag(plan: Plan, name: str, default=0):
+    """A `consts` value, defaulting only when the key is **absent**.
+
+    Not `get(name) or default`: `frontrun_lead=0` is a legitimate setting that the `or` idiom
+    silently turned into 10, so the clamp below was never reached and a genome asking for no lead
+    got the default one instead.
+    """
+    value = (plan.consts or {}).get(name)
+    return default if value is None else value
+
 PASS_ACTION = {"farmer": ["PASS"], "hands": [], "market": []}
 
 _STATE: dict = {}
@@ -58,6 +111,14 @@ def _state(obs, seat: int) -> dict:
         st = {"compiled": None, "compiled_day": -1, "hands_wanted": 0,
               "fallbacks": 0, "blocked": 0, "bought_land": set(), "effects": {}}
         _STATE[seat] = st
+        # O1's patched plan is season state living in its own module, so it has to be cleared on the
+        # same edge this dict is: a worker process plays many games and the second one must not
+        # inherit the first one's branches.
+        branch_points.reset(seat)
+        # P2's working plan is season state in its own module for the same reason O1's is, and it
+        # has to be cleared on the same edge: a worker plays many games and the second one must not
+        # start on the first one's deviations.
+        season_planner.reset(seat)
     return st
 
 
@@ -121,6 +182,22 @@ def _act(obs, seat: int, plan: Plan) -> dict:
     farm = obs["farms"][seat]
     n_hands = len(farm.get("hands") or [])
 
+    step = day * TURNS_PER_DAY + hour
+    _watch_opponent(obs, st, seat, step)
+
+    # O1. Ahead of everything that reads the plan — dawn's shopping list and hour 1's compile both
+    # have to see the same working plan, and a patch that only reached the compiler would buy the
+    # cows it had just decided not to buy. `apply` returns the identical object when no branches are
+    # configured, so the default tree is untouched rather than merely equivalent.
+    plan = branch_points.apply(obs, plan, seat, day, lambda k, n=1: _note(st, k, n))
+
+    # P2. After O1, because the planner searches from the plan the day will actually be played
+    # with, and ahead of everything that reads it — dawn's shopping list and hour 1's compile both
+    # have to see the same working plan (a land purchase decided here has to reach `_dawn`'s
+    # `BUY_LAND` on this very turn, or it is a decision that was never executed). Returns the
+    # identical object when the flag is clear.
+    plan = season_planner.apply(obs, plan, seat, day, hour, lambda k, n=1: _note(st, k, n))
+
     if hour == 0:
         return _dawn(obs, st, plan, seat, day)
 
@@ -154,10 +231,138 @@ def _act(obs, seat: int, plan: Plan) -> dict:
     dropping = [u for u, a in enumerate(actions) if a and a[0] == "DROP"]
     if dropping:
         _note(st, "hand_drops", len(dropping))
+    # O3 front-run. A turn that would emit no market list at all still gets one when the opponent's
+    # next dump is inside the lead and we are holding the product: the shed is only ever *sold* on
+    # dawns, drop turns and hour 23, so without this the front-run could only fire when the routing
+    # calendar happened to agree with the opponent's sell calendar.
+    targets = _frontrun_now(obs, st, plan, seat, step)
+    scheduled = bool(dropping) or hour == LAST_TURN
     market: list = []
-    if dropping or hour == LAST_TURN:
-        market = _sell_orders(obs, plan, seat, st, extra=_carried(obs, dropping))
-    return {"farmer": actions[0], "hands": actions[1:], "market": _dispatch(obs, market, st)}
+    if scheduled or targets:
+        if targets and not scheduled:
+            _note(st, "frontrun_turns")
+        market = _sell_orders(obs, plan, seat, st, extra=_carried(obs, dropping),
+                              frontrun=targets, forced=bool(targets) and not scheduled)
+    return {"farmer": actions[0], "hands": actions[1:],
+            "market": _dispatch(obs, market, st, hoist=_slot_align_targets(st, plan, step))}
+
+
+def _watch_opponent(obs, st: dict, seat: int, step: int) -> None:
+    """O2, wired passively: name the opponent at steps 24/48/72 and stash their supply forecast.
+
+    Nothing downstream reads `st["opp_known"]` or `st["opp_forecast"]` yet — O3 does. It is here
+    now so the counters can be read *in play* rather than from a helper that returned the right
+    value in a test (E44), and so the cost of running it shows up in the latency numbers.
+
+    Its own `try` rather than the one in `agent()`: a passive observer that can forfeit a turn is a
+    strictly worse trade than one that quietly records nothing.
+    """
+    if step == 0:
+        # The season reset for the module-level verdict O3's counter-mix reads (`opponent.LOCKED`).
+        # `_state` rebuilds `st` on step 0; this follows it, for the same reason.
+        opponent.reset_locked(seat)
+        st.pop("frontrun_map", None)
+        st.pop("frontrun_key", None)
+    if step not in opponent.CHECKPOINTS:
+        return
+    try:
+        farms = obs.get("farms") or []
+        if len(farms) < 2:
+            return
+        opp_farm = farms[1 - seat]
+        memory = st.get("opp_memory")
+        if memory is None:
+            memory = st["opp_memory"] = opponent.new_memory()
+        known = opponent.fingerprint(opp_farm, step, memory)
+        st["opp_known"] = known
+        st["opp_forecast"] = opponent.forecast_supply(opp_farm, step, known)
+        opponent.set_locked(seat, known)
+        st.pop("frontrun_map", None)            # the verdict moved; the window map is stale
+        st.pop("frontrun_key", None)
+        _note(st, "fingerprint_checks")
+        if known is not None and st.get("opp_lock_step") is None:
+            st["opp_lock_step"] = step
+            _note(st, "opponent_known")
+            _note(st, f"opponent_is_{known}")
+            if not st.get("opp_lock_noted"):
+                # A step, not a count: `_note` sums, so this is noted **once** per season and the
+                # harness reads the mean back as the step the lock happened on. A re-lock after an
+                # unlock would otherwise report step 48 as 96.
+                st["opp_lock_noted"] = True
+                _note(st, "fingerprint_lock_step", step)
+        elif known is None and st.get("opp_lock_step") is not None:
+            st["opp_lock_step"] = None
+            _note(st, "fingerprint_unlocked")
+        if memory.get("unknown") and not st.get("opp_unknown_noted"):
+            st["opp_unknown_noted"] = True
+            _note(st, "opponent_unknown")
+    except Exception:
+        _note(st, "fingerprint_errors")
+
+
+def _frontrun_map(st: dict, plan: Plan) -> dict:
+    """`{step: {product: units}}` for the whole season, built once per fingerprint verdict.
+
+    Built eagerly and cached rather than scanned per turn: the table is ~160 rows and a lead of 24
+    smears each over 25 steps, so the expanded map is a few thousand small ints — cheaper to build
+    once at the lock than to re-scan six sorted lists on every one of 719 turns, and it keeps the
+    hot path a single dict lookup (the p99 turn budget is 100 ms and the compile already owns most
+    of it).
+    """
+    lead = max(FRONTRUN_LEAD_MIN,
+               min(FRONTRUN_LEAD_MAX, int(_flag(plan, "frontrun_lead", 10))))
+    min_units = max(1, int(_flag(plan, "frontrun_min_units", FRONTRUN_MIN_UNITS)))
+    known = st.get("opp_known")
+    key = (known, lead, min_units, id(st.get("opp_forecast")))
+    if st.get("frontrun_key") == key:
+        return st.get("frontrun_map") or {}
+
+    if opponent.is_self(known):
+        # A mirror match is a different problem (`opponent.SELF_PROFILES`): front-running a copy of
+        # ourselves front-running us is not a hypothesis this task tested.
+        built: dict = {}
+    elif known == "boatlee":
+        built = opponent.windows_from_rows(opponent.settled_schedule(known), lead, min_units)
+    else:
+        # Unknown: their *production* is still public, so the forecast stands in for the schedule,
+        # smeared a day either way because a harvest arriving on day d may be sold on d or d+1.
+        built = opponent.windows_from_rows(st.get("opp_forecast") or {}, lead, min_units,
+                                           spread=FRONTRUN_FORECAST_SPREAD)
+    st["frontrun_key"] = key
+    st["frontrun_map"] = built
+    return built
+
+
+def _frontrun_now(obs, st: dict, plan: Plan, seat: int, step: int) -> dict:
+    """The products to get ahead of on this turn, restricted to ones we are actually holding.
+
+    Holding is checked here and not in `_sell_orders` because it also decides whether the turn gets
+    a market list at all: a front-run that only fires on the turns a hand happens to unload is a
+    front-run bound to the routing calendar rather than to the opponent's.
+    """
+    if not int(_flag(plan, "frontrun", 0)):
+        return {}
+    targets = _frontrun_map(st, plan).get(step)
+    if not targets:
+        return {}
+    shed = ((obs.get("private", {}) or {}).get("shed") or {})
+    reserve = _feed_reserve(obs, seat)
+    return {p: u for p, u in targets.items()
+            if int(shed.get(p, 0) or 0) - int(reserve.get(p, 0) or 0) > 0}
+
+
+def _slot_align_targets(st: dict, plan: Plan, step: int) -> frozenset:
+    """Products a fingerprinted opponent trades on **this exact step** (see `opponent.sell_steps`)."""
+    if not int(_flag(plan, "slot_align", 0)):
+        return frozenset()
+    known = st.get("opp_known")
+    if known is None or opponent.is_self(known):
+        return frozenset()
+    steps = st.get("slot_steps")
+    if st.get("slot_steps_key") != known:
+        steps = st["slot_steps"] = opponent.sell_steps(known)
+        st["slot_steps_key"] = known
+    return frozenset(steps.get(step) or ())
 
 
 def _carried(obs, units) -> dict:
@@ -338,11 +543,14 @@ def _dawn(obs, st: dict, plan: Plan, seat: int, day: int) -> dict:
                 orders.append(["BUY_PRODUCT", item, min(count, afford)])
                 budget -= min(count, afford) * price
 
+    step = day * TURNS_PER_DAY
     orders += _animal_orders(obs, plan, seat, day, budget, st)
-    orders += _sell_orders(obs, plan, seat, st)
+    orders += _sell_orders(obs, plan, seat, st,
+                           frontrun=_frontrun_now(obs, st, plan, seat, step))
 
     farmer_op = _dawn_farmer_op(obs, seat, private)
-    return {"farmer": farmer_op, "hands": [], "market": _dispatch(obs, orders, st)}
+    return {"farmer": farmer_op, "hands": [],
+            "market": _dispatch(obs, orders, st, hoist=_slot_align_targets(st, plan, step))}
 
 
 #: Dawn's ten market slots, in the order they are claimed. Below `_SELL_RANK` is the *supply* half of
@@ -373,7 +581,7 @@ _SELL_RANK = 4
 _ESSENTIAL = ("BUY_SEED", "BUY_PRODUCT")
 
 
-def _dispatch(obs, orders: list, st: dict) -> list:
+def _dispatch(obs, orders: list, st: dict, hoist=()) -> list:
     """Dawn's ten slots go to the orders that cannot wait, and HIRE waits last.
 
     **Why not spread the queue over the day?** `maxMarketOrdersPerTurn` is a **per-turn** cap, not a
@@ -407,7 +615,7 @@ def _dispatch(obs, orders: list, st: dict) -> list:
         _note(st, "dawn_starved_naive")
         _note(st, "dawn_starved_naive_orders", naive_want - naive_kept)
     if len(orders) <= MAX_ORDERS:
-        return orders
+        return _hoist(orders, hoist, st)
 
     _note(st, "orders_truncated")
     prices = current_prices(obs)
@@ -437,7 +645,36 @@ def _dispatch(obs, orders: list, st: dict) -> list:
     if deferred:
         _note(st, "sells_deferred", deferred)
     _note(st, "orders_dropped", len(spill))
-    return keep
+    return _hoist(keep, hoist, st)
+
+
+def _hoist(orders: list, hoist, st: dict) -> list:
+    """O3 slot alignment: put contested sells in the lowest market slots.
+
+    `_process_market`'s outer loop is over the **order index**, and slot `i` is drained for both
+    players and re-priced before slot `i+1` is quoted (`kaggriculture.py:563,628`; `_dispatch`'s
+    docstring above has the per-turn cap half of the same loop). So when both farms sell STRAWBERRY
+    on one step, the one whose order sits at a lower index sells its whole line into the untouched
+    inventory and the other one is quoted after the price has already fallen. Within a *single* slot
+    both players see the same pre-commit quote (`:612-618`), so being early is worth a great deal and
+    being "first" inside a slot is worth nothing — there is no seat advantage to take, only a slot
+    one, and it is taken by moving the order, not by winning a tie.
+
+    Applied **after** truncation, so it can only reorder what was already going out: hoisting a sell
+    must never be able to push an essential buy off the ten-slot queue (E68's failure mode). It is a
+    pure permutation — nothing is added and nothing is dropped.
+
+    Measured on `compiler` vs `boatlee` (seed 67000): 17 same-step same-product collisions a season,
+    of which we sat in the later slot on 11. Small, and free.
+    """
+    if not hoist or not orders:
+        return orders
+    front = [o for o in orders if o and o[0] == "SELL" and o[1] in hoist]
+    if not front or orders[:len(front)] == front:
+        return orders
+    _note(st, "sells_reslotted", len(front))
+    rest = [o for o in orders if not (o and o[0] == "SELL" and o[1] in hoist)]
+    return front + rest
 
 
 def _seed_cost(crop: str) -> int:
@@ -693,7 +930,8 @@ def _dawn_farmer_op(obs, seat: int, private: dict) -> list:
 # --------------------------------------------------------------------------- selling
 
 def _sell_orders(obs, plan: Plan, seat: int, st: dict | None = None,
-                 extra: dict | None = None) -> list:
+                 extra: dict | None = None, frontrun: dict | None = None,
+                 forced: bool = False) -> list:
     """Sell the shed, honouring the plan's floors — until the shed itself becomes the constraint.
 
     Sell-on-sight is the measured default (E11: the whole market-timing apparatus lost to dumping),
@@ -710,7 +948,29 @@ def _sell_orders(obs, plan: Plan, seat: int, st: dict | None = None,
 
     `extra` is stock that is not in the shed yet but will be by the time these orders are processed:
     the inventories of the units DROPping this same turn (see `_carried`).
+
+    **Precedence, O3.** Four rules can want a different quantity of the same product; they are
+    resolved in this order, highest first, and the order is a claim about which one is *right* when
+    they disagree:
+
+    1. `step >= TERMINAL_STEP` — sell everything. Unchanged and unconditional: stock at the buzzer
+       is worth zero, so no floor and no schedule can beat liquidation.
+    2. **front-run** (`frontrun`, this turn's products) — sell everything, **the floor suspended**.
+       A floor is a bet that the price will recover before we need the space; a scheduled dump of
+       34 strawberries is the event that says it will not, and the quote it lands on ($120 -> $55,
+       measured) is below any floor worth setting. Defending a floor into a dump does not protect
+       the price, it just sells the same stock later at the price the dump left behind. The units
+       the floor *would* have withheld are counted separately (`frontrun_floor_override`) so this
+       precedence can be re-litigated from the counters rather than from the argument.
+    3. `sell_floor` — the binary search, unchanged.
+    4. `release_pressure` — releases what 3 withheld, unchanged. Moot for a front-run product,
+       whose stock has already gone out under 2.
+
+    `forced` says this turn had no market list of its own (no DROP, not hour 23, not dawn) and
+    exists only for the front-run, so the counterfactual quantity for the counters is zero rather
+    than what the floor would have allowed.
     """
+    fr = frontrun or {}
     from agent import projection
     plan = projection.scarcity_plan(obs, plan, seat)
     private = obs.get("private", {}) or {}
@@ -732,6 +992,21 @@ def _sell_orders(obs, plan: Plan, seat: int, st: dict | None = None,
             orders.append(["SELL", item, held])
             continue
         floor = float(floors.get(item, 0) or 0)
+        if item in fr:
+            # `frontrun_keep_floor` is the second half of the precedence question, made measurable
+            # instead of argued. With it clear (the default) the front-run suspends the floor; with
+            # it set the floor still sizes the order and the overlay contributes only the *turn* —
+            # the sell happens now rather than at the next DROP. Both arms were run; see the
+            # module note in `_frontrun_note`.
+            allowed = held
+            if floor > 0 and int(_flag(plan, "frontrun_keep_floor", 0)):
+                allowed = _quantity_above_floor(item, held, prices, floor, obs)
+            if allowed > 0:
+                orders.append(["SELL", item, allowed])
+            _frontrun_note(st, item, allowed, held, floor, forced, prices, obs)
+            if allowed < held:
+                withheld.append((item, held - allowed))
+            continue
         if floor <= 0:
             orders.append(["SELL", item, held])
             continue
@@ -751,6 +1026,33 @@ def _sell_orders(obs, plan: Plan, seat: int, st: dict | None = None,
     if step < TERMINAL_STEP and withheld:
         _release_pressure(obs, plan, shed, prices, orders, withheld, st)
     return orders
+
+
+def _frontrun_note(st, item: str, sold: int, held: int, floor: float, forced: bool,
+                   prices: dict, obs) -> None:
+    """Count what the front-run *moved*, never what it ordered.
+
+    "An order is not a sale" (CLAUDE.md) cuts both ways here. `frontrun_units` is the counterfactual
+    difference — units that would still be sitting in the shed on this turn without the overlay —
+    and not the size of the order, most of which would have gone out anyway. `frontrun_value` prices
+    them at the live quote, which is an upper bound on what they fetch (the quote falls as the line
+    executes); the money question is settled by the paired money numbers, and this is the proof the
+    change fired at all (E44).
+    """
+    if st is None:
+        return
+    allowed = held if floor <= 0 else _quantity_above_floor(item, held, prices, floor, obs)
+    base = 0 if forced else allowed
+    moved = sold - base
+    if moved <= 0:
+        return
+    _note(st, "sells_frontrun")
+    _note(st, "frontrun_units", moved)
+    _note(st, f"frontrun_{item}", moved)
+    _note(st, "frontrun_value",
+          int(moved * float(prices.get(item, BASE_PRICE.get(item, 50)) or 50)))
+    if sold > allowed:
+        _note(st, "frontrun_floor_override", sold - allowed)
 
 
 def _release_pressure(obs, plan: Plan, shed: dict, prices: dict, orders: list,
