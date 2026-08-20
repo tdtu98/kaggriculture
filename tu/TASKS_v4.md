@@ -349,7 +349,10 @@ searchable by this line.** P3 was moot before either result (never CPU-bound). C
 games so this failure mode cannot occur by construction; **clone/BC**, provenance-gated; or
 **accept the ceiling and ship the champion via L1**. Pricing cohort timing directly would need the
 divergence itself — the full env with true RNG and a live opponent (`kagsim`, **not importable
-in-submission**) or a residual learned from played games.
+in-submission**) or a residual learned from played games. One further route is now closed by direct
+measurement: **copying boatlee's wheat ramp is not it** — forced in as a data-only variant it fires
+cleanly (wheat sold 42 → 102 units) and loses **−$8.6k to −$18.3k** at every dose and timing, because
+fixed harvest throughput makes wheat displace strawberry ~1:1 at $37 vs $250 (**E85**).
 
 ---
 

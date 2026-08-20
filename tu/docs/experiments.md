@@ -5303,3 +5303,60 @@ the blind spot)**.
 
 **Remaining routes.** Self-play RL, where values come from **played** games and this failure mode
 cannot occur by construction; clone/BC, provenance-gated; or ship the champion via L1.
+
+## E85 — The SE wheat ramp: fires perfectly, loses money at every dose — boatlee's $18.7k is paid for by harvest headroom R2 does not have
+
+**Why this was run.** Boatlee earns **$18.7k of wheat revenue against our $1.2k** (E69/E80), via a
+late **44–57-tile** ramp that is the terminal stage of its relay. Every attempt to reach that
+behaviour so far has been *indirect*: E83's planner carried a `wheat_ramp` candidate that fired
+**zero** times on R2 (structurally blocked — R2 claims every tile and its cash gates SE), and the
+genome searches could express a wheat ramp and simply never kept one. **The isolated experiment had
+never been run.** Absence-of-selection is not a measurement, so this forces the ramp in and prices it.
+
+**Variant: data-only, no code touched.** R2's vector **+ `land_SE=16` + a WHEAT/SE/n-tiles/day-17/
+replant cohort in free slot 7**. `validate()` clean, canonical round-trip, everything else
+**bit-identical**. Premise checked against source first, so a null could not be blamed on the
+market: WHEAT `T=400`, `above_func=log`, **5 shop demanders** (`kaggriculture.py:42,103-111`);
+flooding at our volumes moves the quote only **$25 → $20** — the market absorbs it; R2's
+`sell_floor_wheat` 0.593 is inert here.
+
+**[It fired.]** SE bought **day 18** (cash-gated past the nominal 16), wheat tiles **2–7 → 15–21**
+late-season, and — counted the CLAUDE.md way, by **settled** units, not orders — **wheat SOLD
+42 → 102 units**, revenue **$1,136 → $3,881**. Fallbacks **0**, steps/useful **0.70–0.71**, bars
+clean. This is a change that provably took effect and **still loses money**, which is the only
+configuration in which a null is worth anything (E44).
+
+**[The result] Paired, both seats, 80 games/arm, replicated across two blocks (81000:81040 AND
+82000:82040).** ramp8 vs `starter` **−$8,627** [−10,467, −6,787] / **−$11,454** [−13,487, −9,420];
+ramp16 vs `starter` **−$17,706** / **−$18,318**; ramp8 vs boatlee **−$5,452** / **−$3,846**; ramp16
+vs boatlee **−$6,766** / **−$7,099**. **Every CI clear of zero, replicated, and monotone in dose.**
+Tuning sweep: 16t **−$21k**, 20t **−$23k**, 25t **−$26k**; day 15 and day 19 no different from 17.
+**No size and no timing pays.** Winrates unchanged.
+
+**[The money movement]** (ramp16 vs `starter`, 82000): WHEAT **+$2,745**; STRAWBERRY **−$12,144**
+(units **179 → 127**, straw/plant **5.95 → 4.19**); MELON **−$4,758**; TOMATO **−$1,225**;
+MILK +$362. The wheat gain is real and it is **1/7th** of what it displaces.
+
+**[The mechanism] Labour substitution at 1:7 on price.** Crew harvest/carry capacity is fixed;
+wheat displaces strawberry roughly **unit-for-unit** at **$37 vs $250**. Dusk-inventory probe
+(seed 81000): day 23, R2 carries STRAWBERRY **44** while ramp16 carries STRAWBERRY **36 + WHEAT 33**;
+day 27, **49** vs **17 + 35**. Corroborating over-commitment: `plants_started` **91 → 118** with
+`plants_lost_age` **6.6 → 12.7** (wheat rotting past age 5, never reached), thirst **3.5 → 5.4**, and
+`shed_overflow_discarded` **3 → 49/game** — cheap wheat crowding the 100-cap shed and pushing
+valuable goods over the dusk cliff. The feared `_feedable_animals` herd inflation **did not occur**
+(milk/cow-day flat at 1.05–1.07, herd unchanged), so that hypothesis is dead too.
+
+**Verdict: not a champion candidate; nothing promoted.** This answers "why don't we just do what
+boatlee does" with a measurement instead of an argument. **The market premise holds** and the plan
+layer **can now express the ramp** — so neither is the obstacle. Boatlee's ramp is funded by
+**harvest-throughput headroom its choreography creates**, and R2 has none: every crew step is
+already on strawberry, its most valuable use. Confirms the staging thesis (E81/E84) from an entirely
+new direction — a *data-only* probe reaching the same wall the planner line hit.
+
+**[LESSON] A competitor's profitable subroutine is not portable without the slack that funds it.**
+Copying the visible half of someone else's plan buys their costs at your prices. Any future attempt
+at wheat must **raise harvest throughput first** and add wheat **only after that headroom is
+measured to exist** — never the reverse order.
+
+**Artifacts.** `/private/tmp/wheatramp/` (`build.py`, `vectors.json`, probes, raw paired results).
+Blocks **81000:81040** and **82000:82040** now spent (plus 80000:80001 by a doc smoke).
