@@ -61,9 +61,11 @@ duy_rl/
 │   ├── constants.py
 │   ├── replay.py
 │   ├── features.py
+│   ├── prepare.py
 │   ├── dataset.py
 │   ├── models.py
 │   ├── metrics.py
+│   ├── scripts_support.py
 │   ├── train.py
 │   └── evaluate.py
 ├── scripts/
@@ -99,11 +101,13 @@ index is `0` for the farmer and `1..N` for hands in observation order.
 The v0 label is the first token of the unit operation. The fixed vocabulary is:
 
 ```text
-NORTH SOUTH EAST WEST PASS PICKUP PLANT WATER HARVEST FERTILIZE
-BUILD_COOP BUILD_PASTURE DIG PLACE FEED COLLECT_FERTILIZER CARE
+NORTH SOUTH EAST WEST PASS PICKUP DROP PLANT WATER HARVEST FERTILIZE
+BUILD_PASTURE DIG PLACE FEED COLLECT_FERTILIZER CARE
 ```
 
-An unknown operation is a hard error. Action arguments are preserved as
+These are the 17 worker operations actually represented in the binding
+corpus; `BUILD_COOP` is not represented, while `DROP` is. An unknown operation
+is a hard error. Action arguments are preserved as
 integer-coded metadata for later work but do not contribute to v0 loss or
 metrics.
 
@@ -147,7 +151,13 @@ Each farm encodes:
 
 The two farms are concatenated in stable `self, opponent` order regardless of
 Ryo's seat. Each farm has 22 channels, so `C = 44`. The generated data audit
-publishes this count and tests assert it.
+publishes this count and tests assert it. Because the shard stores one grid per
+step but a step has several actor examples, both actor-position channels are
+zero in the stored grid. The dataset loader copies the selected step grid and
+sets the self-farm actor-position channel from that example's raw actor x/y;
+the opponent actor-position channel remains zero. This preserves the compact
+step-level shard while giving each model example the correct actor-relative
+grid.
 
 ### Actor features
 
@@ -177,6 +187,9 @@ encoding omits the actor-position channel already represented above, making
 The shop vocabulary is `BAKERY`, `BRUNCH_SPOT`, `ICE_CREAM_SHOP`, `PET_CAFE`,
 `PIZZA_SHOP`, `SMOOTHIE_SHOP`, and `YARN_STORE`. With nine market products,
 five seed counts, twelve shed item counts, and the fields above, `G = 62`.
+`FARMERS_MARKET` is a known replay value but is deliberately not a shop-count
+feature because its state is already represented by the nine shared market
+inventory and price pairs. Any other shop name is rejected.
 
 No sample includes reward or any field read from `steps[t + 1].observation`.
 
