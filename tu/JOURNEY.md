@@ -19,7 +19,7 @@ thing, step by step, understanding each piece before we build our version.
 | Chapter | We build | We learn |
 |---|---|---|
 | 1 | Nothing — we read and poke | What a policy, state, and action are |
-| 2 | A replay downloader | Where training data comes from |
+| 2 | Nothing — we check the data we were given | Where training data comes from, and the clock trap |
 | 3 | A data decoder | Behavior cloning = supervised learning |
 | 4 | A tiny model (one decision) | Baselines, and the "always do nothing" trap |
 | 5 | The real model | Action heads, masks, the Orbit-Wars design |
@@ -51,7 +51,8 @@ it. No rewards, no exploring — just "copy the master".
 
 **What we do.**
 1. Open `data/kaggriculture/95029942.json` (a real game between two strong players, ~$105k vs
-   ~$91k — the baseline bot only makes $3.5k). Look at one step: find the observation, find the
+   ~$91k — the baseline bot only makes $3.5k; the same game is also game 1 of our training set, at
+   `data/sample_data_training_model/train/95029942.json`). Look at one step: find the observation, find the
    action. See that the action has a part for the farmer, a part for each hired hand, and a part
    for market orders.
 2. Skim `Orbit-Wars/README.md`. Notice their recipe: **replays → BC → PPO self-play**. That
@@ -62,27 +63,51 @@ this is the action, and the policy is the hidden thing that connected them."
 
 ---
 
-## Chapter 2 — Get the data
+## Chapter 2 — The data (we already have it)
 
-**The idea.** A neural network needs many examples. One game gives us ~1,400 (state, action)
-pairs. We want hundreds of games, so we download replays of top players from Kaggle (each game is
-one JSON file like our sample).
+**Good news: the training data is already here.** It sits in
+`data/sample_data_training_model/` — 2.9 GB, **100 real Kaggle games**, already split into
+`train/` (70), `val/` (15) and `test/` (15), plus a `manifest.csv` describing every game.
 
-**What we do.**
-1. Write a small script that downloads episodes from Kaggle for chosen top teams and saves them as
-   `data/replays/<episode_id>.json.gz` (~400 KB each — 1,000 games is only ~0.4 GB).
-2. Start with **just 10 games from one top player**, because of the trap below.
+**What it is, in one line: 100 games that one strong player — "Ryo Hasegawa" — won.**
 
-**⚠ The clock trap (important, and interesting).** Some top "players" here are not reacting to the
-game at all — they are scripts that replay the same fixed 719 moves every game (we proved one
-leaderboard bot does exactly this). If we train on a script, the smartest thing our model can
-learn is "look at the step number, output the memorized move" — a *clock*, not a player. It would
-score great on paper and fall apart the moment a game goes differently. So before training on
-anyone, we check: **do their actions differ between their games?** If yes, they're really playing
-(good teacher). If no, they're a tape recorder (we keep at most a couple of their games).
+- Ryo is in **all 100 games and won all 100**. Earnings ranged from $48,467 to $165,959, median
+  $91,697. (The baseline bot makes $3,507.)
+- 36 different opponents, so the games are varied. `boatlee`, the famous scripted bot in this repo,
+  shows up once — as an opponent Ryo beat.
+- Ryo sometimes plays as player 0 and sometimes as player 1. `manifest.csv` has a `ryo_seat` column
+  telling us which, per game. **We always clone Ryo's side.**
 
-**How we know we're done.** 10+ games on disk, and for each teacher a simple answer: "reacts" or
-"tape recorder".
+So this is a **single-teacher** dataset: we are not learning "how good players play in general", we
+are learning "how *this* player plays". That is a cleaner and easier problem, and it is the right
+one to start with.
+
+If we ever want more games, we write a downloader — see `PLAN_BC.md` Chapter 2 for how.
+
+**⚠ The clock trap (important, and interesting — and we already tested for it).** Some top
+"players" here are not reacting to the game at all: they are scripts that replay the same fixed 719
+moves every time (`boatlee` does exactly this — proven). If we trained on a script, the smartest
+thing our model could learn is "look at the step number, output the memorized move" — a *clock*,
+not a player. It would score beautifully on paper and fall apart the moment a game went
+differently.
+
+So we checked, two ways:
+
+1. **Hash every player's whole action sequence.** Zero duplicates anywhere in the 100 games. Nobody
+   is submitting the same tape twice.
+2. **Compare Ryo's games step by step, in pairs.** Result: **74%–96% of steps differ between two
+   Ryo games, median 96%.** They really are reacting.
+
+One lovely detail fell out of that: **the steps that *are* identical all sit at indices 0–31.** Ryo
+plays a **fixed ~30-step opening routine** — same buy, same first plantings — and then plays
+reactively for the remaining ~690 steps. That is worth knowing: those first 30 steps are almost
+free to predict and carry almost no learning signal.
+
+**Verdict: Ryo is a genuine reactive teacher. The tape-recorder risk is retired for this dataset.**
+
+**How we know we're done.** You have opened `manifest.csv`, you can say which split a game is in,
+which seat Ryo played, and who they beat — and you can explain in your own words why the clock trap
+would have been invisible in an accuracy score.
 
 ---
 
@@ -102,12 +127,14 @@ pair — *the state the player saw* and *the action they chose in it*.
 2. **Player 2's saved observation is missing its `step` field.** Easy fix: `step = day*24 + hour`.
    But we must do it, or player-2 data is subtly broken.
 
-**What we do.** Write `bc/decode.py`: read a replay, apply the two fixes, output clean pairs with
-the checks built in as assertions (if a check fails, the program stops — we never train on
-suspicious data).
+**What we do.** Write `bc/decode.py`: read a replay from `data/sample_data_training_model/`, look up
+in `manifest.csv` which seat Ryo played, keep **his** side, apply the two fixes, and output clean
+pairs with the checks built in as assertions (if a check fails, the program stops — we never train
+on suspicious data).
 
-**How we know we're done.** The decoder runs over all downloaded games with **zero** assertion
-failures, and prints how many training pairs we have.
+**How we know we're done.** The decoder runs over all 100 provided games with **zero** assertion
+failures, and prints how many training pairs we have (it should be about 50,000 states from the 70
+training games).
 
 ---
 
@@ -118,10 +145,15 @@ decision only — for example: "will this worker act this turn, or do nothing?" 
 or a 2-layer network, a few hand-picked features (hour of day, is a plant ready, etc.).
 
 **The lesson this chapter exists for: the "always do nothing" trap.** In this game, the most
-common single action is very frequent (~16–19% of decisions are just WATER or PASS). A model can
-get a nice-looking accuracy by *always predicting the most common thing*. So the rule for the rest
-of the journey: **an accuracy number means nothing by itself — it only means something compared to
-the "always guess the most common action" baseline.** We compute that baseline first, always.
+common single action is very frequent (in the old sample game, ~16–19% of decisions were just WATER
+or PASS — we recompute the real number on Ryo's own games). A model can get a nice-looking accuracy
+by *always predicting the most common thing*. So the rule for the rest of the journey: **an
+accuracy number means nothing by itself — it only means something compared to the "always guess the
+most common action" baseline.** We compute that baseline first, always.
+
+**One extra catch from Chapter 2:** Ryo's first ~30 steps are a fixed opening they play every game.
+They are trivially predictable and teach the model nothing. So we always report two numbers: over
+all steps, and over steps 32 onwards. The second one is the real one.
 
 **What we do.** Build features → train the tiny model → compare against the majority baseline.
 
@@ -172,7 +204,8 @@ training, and the "expert action was masked out" counter reads zero.
 720-step games against the bots in this repo.
 
 **And here comes the big lesson: distribution shift.** Our model was trained only on situations a
-*top player* got into. The first time it makes a small mistake, it lands in a situation the expert
+*top player* got into — and, since all 100 of our games are games Ryo *won*, it has barely seen
+what losing looks like. The first time it makes a small mistake, it lands in a situation the expert
 never showed it — so it makes a bigger mistake, and lands somewhere stranger still. Errors
 *compound*. This is THE gap between "high test accuracy" and "actually plays well", and it's why
 BC alone almost never fully matches its teacher. (For the curious: the theory says a small
@@ -250,7 +283,8 @@ stays easy.
 
 ## The concepts you'll own by the end
 
-By chapter: **1** state / action / policy · **3** why data quality beats model cleverness ·
+By chapter: **1** state / action / policy · **2** the clock trap, and why a dataset must be checked
+before it is trusted · **3** why data quality beats model cleverness ·
 **4** baselines and class imbalance · **5** action heads, pointers, masking · **6** distribution
 shift and compounding error — the heart of imitation learning · **7** DAgger ·
 **8** reward, policy gradient, PPO, self-play · **9** what makes ML code portable.

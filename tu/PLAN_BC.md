@@ -211,40 +211,97 @@ creates, which is the problem Chapter 6 is entirely about.
 
 ---
 
-# Chapter 2 — Get the data
+# Chapter 2 — The data (already provided)
 
 ## The idea
 
-A network needs many examples. One game gives ~1,438 (state, action) pairs. We want hundreds of
-games, so we download replays of strong Kaggle players.
-
-**But first we must find out whether those "players" are actually playing.**
+A network needs many examples. **We have them.** A real training corpus was handed to us: 100
+Kaggle games, pre-split, with an index file. This chapter is therefore no longer about acquiring
+data — it is about **knowing exactly what we were given**, checking it, and understanding the one
+way this particular dataset could still mislead us.
 
 ## What we build
 
-`bc/acquire.py` — a small, throwaway-quality downloader. `data/replays/{episode_id}.json.gz` as a
-permanent archive. Two measurements that decide whether the whole program is viable.
+Nothing downloads. We verify the corpus, read `manifest.csv`, and record the two clock-trap
+measurements. `bc/sources/replay.py` reads from the provided directory.
 
 ## The details
 
-### Four unknowns, and none can be checked offline
+### What is in `data/sample_data_training_model/`
 
-Do these in one evening, with a script you are happy to delete:
+All facts in this section are [MEASURED, single-source] — measured once, this session, on the
+provided files.
 
-| ID | Unknown | Cheapest way to settle it |
-|---|---|---|
-| T0-a | Does the Kaggle Episodes API cover this competition? | `POST .../competitions.EpisodeService/ListEpisodes` with `{"teamId": <int>}`. Look for HTTP 200 and an `episodes[]` array. |
-| T0-b | What does a downloaded replay look like? | `POST .../GetEpisodeReplay` with `{"episodeId": 95029942}`. Compare the body against our sample file. If it matches, everything in Chapter 3 applies unchanged. |
-| T0-c | What is the rate limit? | Unknown. **Do not guess a number into this plan.** Measure: 20 requests in a row, record HTTP 429s and latency. |
-| T0-d | Which credentials work? | `~/.kaggle/` holds **only** `access_token` — no classic `kaggle.json`. `which kaggle` → not found. `import kaggle` → ModuleNotFoundError [MEASURED, verified]. Find out which auth these endpoints accept. |
+| Property | Value |
+|---|---|
+| Size / files | **2.9 GB, 100 episode JSONs** |
+| Splits (pre-made) | `train/` **70**, `val/` **15**, `test/` **15** |
+| Index files | `manifest.csv` (one row per episode), `split_summary.json` |
+| Filenames | the `EpisodeId`, matching `info.EpisodeId` |
+| Schema | all 100 match the replay schema in Chapter 3 **exactly** |
+| Version | all **`module_version 1.32.7`** — no version skew to handle |
+| Status | all `statuses == "DONE"` on both seats |
+| Shape | 720 steps × 2 seats in every file |
+| Seeds | `info.seed` unique per file — no duplicate games |
+| Overlap | `train/95029942.json` is **byte-identical** to `data/kaggriculture/95029942.json`, the sample file used throughout Chapter 1 |
 
-**Preferred approach.** Meta Kaggle publishes `Episodes.csv` and `EpisodeAgents.csv` daily. Use
-that as the *index* — it is a bulk download with no rate limit — to decide which episodes belong to
-which strong agent. Then spend the rate-limited `GetEpisodeReplay` calls only on episodes we
-already chose. This falls apart if Meta Kaggle's refresh lags the competition; check
-`max(Episodes.CreateTime)` against today's date.
+`manifest.csv` columns: `episode_id, split, source_date, source_path, source_sha256, opponent,
+ryo_seat, ryo_reward, opponent_reward, margin, margin_quartile, shop_profile, route_family`.
 
-### ⚠ The clock trap — the risk that can kill this line
+### This is a single-teacher dataset
+
+**"Ryo Hasegawa" appears in all 100 episodes and won all 100** [MEASURED, single-source].
+
+| | |
+|---|---|
+| Ryo's reward | min **$48,467** / median **$91,697** / max **$165,959** |
+| `starter` baseline | $3,507 |
+| Ryo's seat | varies per game — the `ryo_seat` column says which |
+| Distinct opponents | **36**, long-tailed: `tetsuya` 25, `カワシギ` 10, `Arman Tuganbaev` 9, … and **22 opponents appear exactly once** |
+| `boatlee` | appears **once**, as an opponent Ryo beat ($131,000 vs $124,469, episode 94436914, train split) |
+
+So the task is not "learn how strong players play in general". It is **"clone Ryo"**. That is a
+narrower and easier problem, and it is the right one to start with. Everything downstream follows
+from it — the split design, the label emission in Chapter 3, and what the evaluation in Chapter 6
+is entitled to claim.
+
+### The curation, and the one bias it introduces
+
+The 100 games were **selected from 126 candidate wins**, stratified across `opponent`, `ryo_seat`,
+`source_date`, `margin_quartile`, `shop_profile` and `route_family` (those derived columns are in
+`manifest.csv`) [MEASURED, single-source]. The stratification is good: it means we are not
+accidentally training on 100 games against one opponent, or 100 games with the same shop draw.
+
+**But the corpus is win-filtered, and that has a consequence worth stating plainly.**
+
+> Ryo only ever appears winning. So the model will rarely, if ever, see what a *losing* position
+> looks like, or what Ryo does to climb out of one. States where the game is going badly are
+> underrepresented in training — and those are exactly the states our own model will reach first
+> when it makes a mistake. That is Chapter 6's distribution-shift problem, made slightly worse by
+> the data selection.
+
+We do not fix this now. We note it, and we expect it to show up as a steeper handover curve
+(Chapter 6) and as the thing DAgger (Chapter 7) or PPO (Chapter 8) has to repair.
+
+### The splits are by GAME, not by player — and that is correct here
+
+The provided split holds out **whole games**, not players. Chapter 2 of an earlier draft argued for
+holding out *agents* instead. Both are right, for different datasets:
+
+- **Held-out agents** answers "does this generalize to players we have never seen?" That question
+  only exists if we train on multiple teachers.
+- **Held-out games** answers **"can we reproduce Ryo's play in games they have never played?"** With a
+  single teacher, that is the honest and the only meaningful question — and it is exactly what the
+  provided split measures.
+
+So: **use the provided split as-is.** The held-out-agent design stays in this plan only as the rule
+to apply *if* we ever add a second teacher.
+
+What still holds without change: **never split by step.** Two neighbouring steps in one game share
+~99% of the farm, so a random step split measures "can you recall a nearly identical row", not "can
+you play". The provided split already avoids this by construction, since it splits whole files.
+
+### ⚠ The clock trap — the risk that could have killed this line, and the check that retired it
 
 Some top agents in this competition **do not look at the board**. `boatlee`, a real leaderboard
 agent, replays a fixed 719-move list. Measured over six games against our champion: unit actions
@@ -259,44 +316,88 @@ lookup table this repo already stores exactly and for free.
 
 **Offline accuracy cannot detect this.** It has to be measured on the data, before training.
 
-### Two different tests, and neither replaces the other
+### Test A — does the teacher vary between their own games? **PASSED** (E88)
 
-**Test A — "does this agent vary?" (needs ≥2 games from one agent).**
-Over the 719 × 13 grid of (step, worker slot), compute the fraction of slots where the action
-differs between at least two of that agent's games. Call it the **slot-variance rate**.
-Also hash the whole action sequence — an exact hash collision means a pure replay.
-Sample hashes, for reference [MEASURED, single-source]: seat 0 `14dcc5a044f37bbe`
-(113,740 bytes of canonical action JSON), seat 1 `cf841c2a80077642` (115,149 bytes).
+Two measurements, both [MEASURED, single-source], both on the provided corpus:
 
-**Test B — "is there anything state-driven in this data at all?" (works on one game).**
-Fit two tiny models on the same replay. Model 1 sees **only the step number**. Model 2 sees
+**(a) Hash every player's complete action sequence, across all of their episodes.**
+Result: **zero duplicate hashes anywhere in the 100 games**, for any player. Nobody in this corpus
+submits the same tape twice.
+
+**(b) Compare Ryo's games against each other, step by step.** 24 randomly sampled Ryo games,
+compared as **12 disjoint pairs**, testing whole-action equality at each step.
+Result: **74%–96% of steps differ, median 96%.** Even a pair played against the *same* opponent
+(`tetsuya`) differed on **75%** of steps.
+
+> **Verdict: Ryo is a genuine reactive teacher. The tape-recorder risk is retired for this
+> dataset.**
+
+**And one structural detail fell out of it, which we use later.** The steps that *are* identical
+across a pair concentrate almost entirely at **indices 0–31** — verified on a pair that shared
+exactly steps 0–31 plus the final step 719. So:
+
+> **Ryo plays a fixed ~30-step opening routine, then plays reactively for the remaining ~690
+> steps.**
+
+Those first ~30 steps are nearly free to predict and carry close to zero learning signal. Chapter 4
+and Chapter 5 both report metrics **with and without them**, so that a healthy-looking headline
+number is not just the opening being memorized.
+
+*(Method note, kept because the earlier draft got this wrong: this is a proper **pairwise** test —
+game A against game B, step by step. Comparing every game against a single reference, or comparing
+aggregate action counts, would not distinguish "reactive" from "same script, different order".)*
+
+### Test B — is there state-driven structure at all? **Still to run** (E86)
+
+Test A proves Ryo's actions *change* between games. It does not prove those changes are driven by
+the **state** rather than by, say, the random seed leaking through the opponent. So the deeper
+check still runs exactly as designed:
+
+Fit two tiny models on the same corpus. Model 1 sees **only the step number**. Model 2 sees
 **state features with the step number removed**. Compare held-out agreement.
-**Run it on `boatlee` first**, where we already know the answer from E48 — that validates the test
-harness before we trust it on unknown data.
+**Run it on `boatlee` first**, where we already know the answer from E48 — that validates the
+harness before we trust it on Ryo.
 
-Test A asks "does this *agent* vary?" Test B asks "is there state-driven structure in the corpus at
-all?" Test B still works when we can only get one game per agent; Test A does not.
+Test A asks "does this *agent* vary?" Test B asks "is the variation *state-driven*?" Passing A is
+necessary and not sufficient; Chapter 6's anti-clock ablation (E90) is the same question asked of
+the trained model.
 
-### What each result means
+### Where we land on the yield ladder: the top row
 
-| Slot-variance | What it means | What we do |
+The earlier draft planned to branch on how many games we could get. We are in the best case and can
+stop thinking about it:
+
+| Measured yield | What we do | Us? |
 |---|---|---|
-| Exact hash collision | Pure replay | Keep 1 game from that agent |
-| < 5% | Near-replay, a couple of reactive branches | Keep **at most 3** games from that agent |
-| > 30% | Genuinely reactive | Good teacher, keep everything |
+| **≥100 games, one verified reactive teacher** | Train on the provided split as-is. | **← we are here (100)** |
+| 20–100 games | Train anyway, and write "generalization is weakly measured" on every result. | — |
+| <20 games, or no usable teacher | Switch teacher to the compiler. | — |
 
-**This is a per-agent curation rule, not a reason to abandon the program.** Even a fully scripted
-leaderboard leaves us the compiler teacher below.
+*(The original ladder's top row demanded "≥200 games, ≥10 agents" because it assumed a
+multi-teacher corpus and a held-out-agent split. With a single teacher that requirement does not
+apply; 100 games of one verified reactive teacher is the stronger position for the question we are
+actually asking.)*
 
-### The yield ladder — branch on how many games we actually get
+### Only if we need more data: the Kaggle API
 
-| Measured yield | What we do |
-|---|---|
-| **≥200 games, ≥10 agents** | As written. A held-out-agent test set is honest. |
-| **20–200 games** | Train anyway, but a held-out-agent split is probably impossible. Fall back to a held-out-*episode* split, and **write "generalization is unmeasured" on every result we produce.** Top up with compiler-generated data. |
-| **<20 games, or the API is closed** | **Switch teacher to the compiler.** |
+**Skip this section unless the corpus turns out to be too small.** It is preserved because it is
+the recovery path, not because it is on the critical path.
 
-### The compiler fallback — our structural insurance
+Four unknowns, none checkable offline. One evening, with a script you are happy to delete:
+
+| ID | Unknown | Cheapest way to settle it |
+|---|---|---|
+| T0-a | Does the Kaggle Episodes API cover this competition? | `POST .../competitions.EpisodeService/ListEpisodes` with `{"teamId": <int>}`. Look for HTTP 200 and an `episodes[]` array. |
+| T0-b | What does a downloaded replay look like? | `POST .../GetEpisodeReplay` with `{"episodeId": 95029942}`. Compare the body against our provided files — episode 95029942 is in `train/`, so this is a byte-for-byte check. |
+| T0-c | What is the rate limit? | Unknown. **Do not guess a number into this plan.** Measure: 20 requests in a row, record HTTP 429s and latency. |
+| T0-d | Which credentials work? | `~/.kaggle/` holds **only** `access_token` — no classic `kaggle.json`. `which kaggle` → not found. `import kaggle` → ModuleNotFoundError [MEASURED, verified]. Find out which auth these endpoints accept. |
+
+Preferred approach if it comes to it: Meta Kaggle publishes `Episodes.csv` and `EpisodeAgents.csv`
+daily. Use that as the *index* — bulk, no rate limit — to pick which episodes belong to which
+agent, then spend the rate-limited `GetEpisodeReplay` calls only on episodes already chosen. If we
+do add games from a second teacher, **the held-out-agent split rule comes back into force.**
+
+### The compiler fallback — insurance, not a likely path
 
 `agent.verify.compile_day(obs, …)` produces (state, action) pairs at **any** state we ask about, in
 unlimited quantity. The decoder, the features, the masks, the model, the loss and the whole
@@ -313,62 +414,75 @@ already contain full per-step observations for both seats. (`obs.farms` alone is
 file.) An earlier draft of this plan proposed regenerating them; that proposal was describing
 `traces/`, a different artifact, and the workstream is deleted.
 
-### How much data is enough
+### How much data we actually have
 
-~3,945 real decisions per player per game → **≥50 games ≈ 400,000 decisions** for the model size in
-Chapter 5. Below that, the model shrinks or the compiler fills the gap.
+We clone **Ryo's seat only** (below), so one game yields 719 pairs, not 1,438:
 
-### Which games, which seats
+| Split | Games | State rows (719 each) | Worker decisions (~10.5/step) | Macro decisions (3,945/game) |
+|---|---|---|---|---|
+| `train` | 70 | **≈ 50,330** | **≈ 530,000** | **≈ 276,000** |
+| `val` | 15 | ≈ 10,785 | ≈ 113,000 | ≈ 59,000 |
+| `test` | 15 | ≈ 10,785 | ≈ 113,000 | ≈ 59,000 |
 
-| Axis | Rule |
-|---|---|
-| **Which agents** | Top 10–20 by final rating, plus the slot-variance filter. Never top-1 only — one agent's quirks become the model's whole worldview. |
-| **Which seats** | **Both seats of every accepted game.** The *loser* in our sample banked $90,833 — 26× the baseline. Throwing that away discards half the data to remove a distinction that is noise at this skill level. Seat asymmetry is also real: market orders settle player-by-player, interleaved (`kag.py:615-625`), so training only seat 0 leaves seat-1 behaviour unmodelled. |
-| **Reward floor** | Filter on **absolute** bank, not on who won — an agent can win small against a weak opponent. Drop any seat whose `statuses[p] != "DONE"`; TIMEOUT and ERROR seats have truncated or garbage action tails. |
-| **Version** | Weight by game version, never by date (below). |
+Two thresholds this comfortably clears:
 
-### Version skew — train on 1.32.7 only, archive everything
+- **The ≥20,000-labelled-decisions floor for offline metrics** (Chapter 4) — validation alone has
+  roughly 113,000 worker decisions, five times over.
+- **The ≥50-game / ~400,000-decision minimum for the 430k model** (Chapter 5) — 70 training games
+  and ~530,000 worker decisions clear it.
 
-`module_version` is a top-level key in the replay JSON (our sample: `"1.32.7"`), and the full
-`configuration` is stored too [MEASURED, verified].
+So the data does not bind the model size. Chapter 5's "start small" argument stands on its other
+leg: 276,000 macro decisions from **one** teacher is still a narrow distribution, and a big model
+will memorize it.
 
-Why this matters: **E33** measured that version 1.32.6 cut market demand **4.7×** and changed shop
-draws to with-replacement. **E54** measured 1.32.7 adding a scarcity spike. A market-timing policy
-copied from 1.32.6 play is optimized against a demand curve that no longer exists.
+### Which seat we clone
 
-Nuance worth keeping: the **walking/watering/harvesting behaviour is far less version-sensitive
-than the market behaviour** — E33 and E54 changed market curves, not tile mechanics. So the ranked
-fallback if 1.32.7 games are scarce is: (1) 1.32.7 only; (2) worker heads on 1.32.6+1.32.7, market
-heads on 1.32.7 only, with a version feature; (3) everything, with a version flag — **only** if an
-ablation shows it helps. Store `module_version` and a `config_hash` as columns on every shard so
-all three are a filter, not a re-download.
+**Ryo's seat, in every game, read from the `ryo_seat` column of `manifest.csv`.**
 
-### Splits — split by agent first, then by game, never by step
+This overturns an earlier recommendation, and the reason is the dataset, not a change of mind. The
+earlier draft said "train on both seats of every game" — correct when both seats are strong players
+and you want to double your data. Here the other seat is **36 different opponents of unknown and
+varying quality**, 22 of whom appear exactly once. Cloning them would blur the single clean policy
+we are trying to learn.
 
-- **Splitting by step is fatal.** Two neighbouring steps in one game share ~99% of the farm. A
-  random step split puts near-identical states in both train and validation, and validation
-  accuracy then measures "can you recall a nearly identical row", not "can you play".
-- **Splitting by game is still leaky for a scripted agent** — two games from the same script share
-  an identical 719-action label sequence.
-- Therefore **held-out agents are the only honest generalization signal.**
+**But the decoder still emits opponent-seat labels behind a flag** (Chapter 3). They are free to
+produce, and there are two later uses: a "both seats" ablation, and opponent-modelling if we ever
+want it.
 
-| Split | Contents |
-|---|---|
-| `train` | Games from agents in the training roster |
-| `val` | Held-out **games** from *training* agents. Measures fit. Drives early stopping. |
-| `test-agent` | All games from 2–3 **entirely unseen agents**. The only number we are allowed to call "generalization". |
+*Still true and unchanged:* seat asymmetry is real — market orders settle player-by-player,
+interleaved (`kag.py:615-625`) — which is exactly why the features canonicalize into "me" and
+"them" (Chapter 5) rather than feeding a seat index. Ryo plays both seats across the corpus
+(`ryo_seat` varies), so canonicalizing means both are one distribution and nothing is lost.
 
-Assign agents to splits by `sha1(agent_name)` bucketing so the split stays the same as new games
-arrive. Agent identity comes from `info.TeamNames[p]`.
+*Also unchanged as a rule for any future data:* drop any seat whose `statuses[p] != "DONE"` —
+TIMEOUT and ERROR seats have truncated or garbage action tails. All 200 seats in this corpus are
+`DONE`, so nothing is dropped today.
 
-### Storage — two tiers
+### Version skew — nothing to do here, but keep the rule
 
-**Tier 1, permanent archive: `data/replays/{episode_id}.json.gz`.** Measured **394,523 bytes per
-game** → **~0.39 GB per 1,000 games**, ~3.9 GB at 10,000 [MEASURED, verified]. **Keep the raw bytes
-forever.** Decoding bugs are the most likely defect in this whole pipeline, and re-downloading
-under an unknown rate limit is the expensive way to recover from one.
+**All 100 games are `module_version 1.32.7`** [MEASURED, single-source], which is the version this
+repo is pinned to. There is no skew to handle.
 
-**Tier 2, training shards: `data/shards/{split}/{agent}-{episode_id}.npz`** (gitignored). A
+Keep the rule for the day there is: **E33** measured that 1.32.6 cut market demand **4.7×** and
+changed shop draws to with-replacement; **E54** measured 1.32.7 adding a scarcity spike. A
+market-timing policy copied from 1.32.6 play is optimized against a demand curve that no longer
+exists. Note also that walking/watering/harvesting behaviour is far less version-sensitive than
+market behaviour — E33 and E54 changed market curves, not tile mechanics. Store `module_version`
+and a `config_hash` as columns on every shard anyway, so that a future filter is a query rather than
+a re-decode.
+
+### Storage — the corpus is the archive
+
+**Tier 1 is already on disk: `data/sample_data_training_model/{split}/{episode_id}.json` —
+2.9 GB uncompressed, 100 games.** Do not modify these files, and do not delete them: decoding bugs
+are the most likely defect in this whole pipeline, and the raw bytes are the only way to recover
+from one. `manifest.csv` carries a `source_sha256` per episode, so corruption is detectable.
+
+If we ever add downloaded games, store them gzipped as `data/replays/{episode_id}.json.gz` —
+measured **394,523 bytes per game**, so **~0.39 GB per 1,000 games** [MEASURED, verified].
+
+**Tier 2, training shards: `data/shards/{split}/{episode_id}.npz`** (gitignored), with `{split}`
+taken straight from the provided directory layout so our splits can never drift from theirs. A
 **shard** is just a file holding a chunk of pre-processed training rows. Flat `.npz`, found by
 `glob`, shuffled at both the shard level and inside each shard, with the last ragged batch dropped
 so shapes stay constant.
@@ -380,23 +494,28 @@ encoding.
 
 ## How we know we're done
 
-10+ games on disk. Every T0 question answered with a measurement, not a guess. For every candidate
-teacher, a one-word verdict: "reacts" or "tape recorder". A teacher chosen using the yield ladder.
-Record the teacher decision as **E86** and the slot-variance numbers as **E88**.
+**Mostly already done.** The corpus is verified against the schema, the splits and `manifest.csv`
+are understood, the teacher is chosen (Ryo, by construction), and Test A is measured and passed
+(**E88**). What remains is Test B — the clock-vs-state ablation on Ryo, with `boatlee` as the
+positive control (**E86**).
 
 ## When we stop
 
-**If Test B shows less than 2 percentage points of state-over-clock advantage on *every* candidate
-teacher — including the compiler — then there is no policy anywhere in reach to imitate, and the
-BC line dies here, for the price of two evenings.**
+**If Test B shows less than 2 percentage points of state-over-clock advantage on Ryo *and* on the
+compiler, then there is no policy in reach to imitate, and the BC line dies here.**
 
-Note what does *not* kill it: a fully scripted leaderboard. That only re-points the teacher at the
-compiler.
+That outcome is now unlikely — Test A already showed 74–96% of steps differ between Ryo's own games
+— but "unlikely" is not "measured", and Test A answers a weaker question than Test B does. Run it.
+
+Note what does *not* kill it: a scripted leaderboard elsewhere. That would only re-point the
+teacher at the compiler.
 
 ## What you should be able to explain
 
-Why a model trained on a scripted agent will score brilliantly offline and collapse online. Why
-offline accuracy cannot detect that. And why we split by agent instead of by step.
+Why a model trained on a scripted agent would score brilliantly offline and collapse online, and
+why offline accuracy cannot detect that. Why holding out whole *games* is the right test for a
+single-teacher dataset while holding out *players* would be the right test for a multi-teacher one.
+And why a corpus of 100 wins under-represents exactly the situations our own model will hit first.
 
 ## Reading
 
@@ -424,6 +543,24 @@ an assertion — a check that stops the program rather than letting it produce q
 on every build.
 
 ## The details
+
+### What the decoder reads, and which side it clones
+
+**Input:** `data/sample_data_training_model/{train,val,test}/{episode_id}.json`, with the split
+taken from the directory rather than recomputed, so our splits can never drift from the provided
+ones.
+
+**Seat:** look up `ryo_seat` for that `episode_id` in `manifest.csv` and emit training pairs for
+**that seat only**. Chapter 2 explains why: the other seat is 36 assorted opponents of unknown
+quality, and cloning them would blur the one policy we are trying to learn.
+
+**But emit the opponent seat behind a flag** (`--include-opponent-seat`, off by default). It costs
+nothing to produce, and it keeps two later options open: a "both seats" ablation, and opponent
+modelling. What we must *not* do is quietly mix it into v1 training and then wonder why the model
+plays like a committee.
+
+Assert, per episode: `info.TeamNames[ryo_seat] == "Ryo Hasegawa"`. If that ever fails, the manifest
+and the files have drifted apart, and every label after it is suspect.
 
 ### Assertion 1 — the off-by-one
 
@@ -613,10 +750,13 @@ requirement**, where fast rollouts make it genuinely necessary.
 
 ## How we know we're done
 
-The decoder runs over every downloaded game with **zero** assertion failures on all four
-assertions. `frac_segments_shortest_path` is computed corpus-wide (E87). The vocabulary is one
-asserted constant. Splits are materialized agent-first. Shard sizes are measured against the 1.5 MB
-threshold. The majority-class floors (Chapter 4) are recomputed on the real corpus.
+The decoder runs over all **100** provided games with **zero** assertion failures on all four
+assertions, and prints the row counts (expect ≈50,330 training states — Chapter 2's table).
+`frac_segments_shortest_path` is computed corpus-wide over Ryo's seat (**E87**). The vocabulary is
+one asserted constant. Shards are written under the provided split names. Shard sizes are measured
+against the 1.5 MB threshold. The majority-class floors (Chapter 4) are recomputed **on Ryo's seat
+over this corpus** — the 16.3% / 19.3% figures came from the old two-seat sample and do not
+transfer.
 
 ## When we stop
 
@@ -669,8 +809,27 @@ If you always predict the single most common action, you already score [MEASURED
 That is the **majority-class baseline** — the score of a model that has learned nothing. A head
 reporting "70% accuracy" means something only when printed next to "the floor is 19.3%".
 
+> **⚠ Those two numbers came from the two seats of the single old sample game. They are the right
+> order of magnitude and the wrong numbers for us.** Recompute the floor **on Ryo's seat, over the
+> 70 training games**, before quoting any accuracy against it. That was always the plan; it now
+> points at `data/sample_data_training_model/train/`.
+
 > **Rule for the rest of the journey: every accuracy number is reported against its majority-class
 > floor, always, with an error bar.**
+
+### ⚠ The opening steps inflate everything — report metrics twice
+
+Chapter 2 measured that **Ryo plays a fixed ~30-step opening routine** and only then starts
+reacting: across pairs of their games, the identical steps concentrate at indices 0–31
+[MEASURED, single-source].
+
+Those ~30 steps are almost perfectly predictable from the step number alone, and they are about 4%
+of every game. A model that has learned nothing except the opening will still post a
+better-than-floor headline number.
+
+> **So every offline metric is reported twice: over all steps, and over steps ≥ 32 only.** The
+> second number is the real one. If they differ a lot, the model has learned the opening and not
+> much else.
 
 ### The error bar — what a Wilson interval is and why we use it
 
@@ -684,6 +843,9 @@ Concretely: **a "70% vs a 19% floor" claim computed on 800 examples is the same 
 
 > **Validation must contain at least 20,000 labelled decisions, and every offline number is printed
 > as `value [low, high]` next to its floor.**
+
+Our `val` split clears this by a wide margin: 15 games × 719 steps × ~10.5 worker decisions ≈
+**113,000** decisions (Chapter 2). Even after dropping the opening steps it is ~108,000.
 
 ### Which heads to report
 
@@ -943,7 +1105,9 @@ v1 breakdown: the four shared encoders (tiles, workers, products, global; 128 wi
 ≈ 65k; verb/item/quantity heads ≈ 204k; market heads ≈ 50k; sequence-state update ≈ 35k; value head
 ≈ 17k. It trains in minutes on this Mac.
 
-**Why small: the dataset binds us, not the compute.** Fifty games is only ~400,000 decisions. A
+**Why small: the dataset binds us, not the compute.** Our 70 training games give ~530,000 worker
+decisions and ~276,000 macro decisions — enough for this model and no more, and all of it from a
+**single** teacher, which is a much narrower distribution than the raw count suggests. A
 3-million-parameter transformer on that memorizes: the loss curve looks wonderful and the arena
 winrate does not move — this repo's single most repeated failure. Orbit Wars' own first model was
 460k parameters of exactly this shape and beat its baseline 100% of the time.
@@ -1003,6 +1167,11 @@ distribution.
 The theory says a per-step error rate ε can grow like **T²·ε** over T steps. Our T is **719**. A 1%
 per-step error is not a 1% problem.
 
+**Our dataset makes this slightly worse, and we should expect it.** All 100 training games are
+games Ryo **won** (Chapter 2). So the model has barely seen a losing position, and "losing" is
+exactly where its own first mistakes will put it. Expect a steeper handover curve than a
+win/loss-balanced corpus would give.
+
 ## What we build
 
 The agent wrapper, the four-rung evaluation ladder, and the handover experiment.
@@ -1012,7 +1181,9 @@ The agent wrapper, the four-rung evaluation ladder, and the handover experiment.
 ### The evaluation ladder — four rungs, each gating the next
 
 **Rung 1 — offline, per head, every epoch.** Top-1 and top-3 agreement per head, each next to its
-majority floor (16.3% / 19.3%) with a Wilson interval, on ≥20,000 validation decisions.
+majority floor — **recomputed on Ryo's seat over the training split**, not the old 16.3% / 19.3%
+sample figures — with a Wilson interval, on ≥20,000 validation decisions (we have ~113,000). Report
+every number twice: all steps, and steps ≥ 32 only (Chapter 4's opening caveat).
 
 > **Rung 1 can only falsify, never confirm.** A high score is entirely consistent with having
 > learned "read the step number, output the memorized move".
@@ -1020,6 +1191,10 @@ majority floor (16.3% / 19.3%) with a Wilson interval, on ≥20,000 validation d
 **The mandatory companion — the anti-clock ablation (E90).** Re-score the validation set with the
 `step`, `day` and `hour` features **zeroed out**. A real policy loses a lot of accuracy; a clock
 loses almost none.
+
+**Run this on steps ≥ 32 only.** Ryo's fixed ~30-step opening (Chapter 2) genuinely *is* a function
+of the clock, so including it would mask a real problem: a model that learned the opening and
+nothing else would show a small, reassuring drop.
 
 > **If accuracy drops less than 5 percentage points, the model is a clock, not a policy. Stop and
 > fix the DATA, not the model.**
@@ -1289,7 +1464,7 @@ surface area.
   margin-sign is the wrong objective. `PLAN_v4` §0 targets winrate, so follow that — but test
   normalized margin once and record the answer.*
 - **Discount γ = 0.999, not 1.0.** A **discount** decides how much a future dollar counts now.
-  1st place's single biggest regret was that γ = 1.0 made his agent stall.
+  1st place's single biggest regret was that γ = 1.0 made their agent stall.
 - **KL-anchored to the BC checkpoint, with a decaying coefficient.** **KL** measures how far the new
   policy has drifted from the old one; anchoring keeps early RL from destroying the prior we paid
   for. The coefficient comes from measurement (E96), not folklore.
@@ -1431,8 +1606,9 @@ Ordered by probability × how expensive it is to discover late.
 
 | # | Risk | Chapter | What protects us |
 |---|---|---|---|
-| 1 | **Not enough replays, or the API is closed** | 2 | The yield ladder; the compiler-as-teacher seam built from day one |
-| 2 | **The teachers are scripts** — the model learns a clock | 2, 6 | Slot-variance test + clock-vs-state test; the ≥5pp anti-clock ablation as a hard stop |
+| 1 | ~~Not enough replays, or the API is closed~~ **RETIRED** | 2 | 100 verified games are on disk. The compiler seam stays as insurance. |
+| 1b | **Single-teacher, win-filtered corpus** — narrow distribution, losing positions barely represented | 2, 6 | Named openly; expect a steeper handover curve; Chapters 7–8 are the repair |
+| 2 | **The teacher is a script** — the model learns a clock — **Test A PASSED** | 2, 6 | Test A measured (74–96% of steps differ); Test B (E86) still to run; the ≥5pp anti-clock ablation on steps ≥32 as a hard stop |
 | 3 | **The (state, action) off-by-one** — trains fine, converges fine, clones the wrong move | 3 | The 1,438/1,438 hand-roster assertion, hard-asserted in the decoder |
 | 4 | **The mask rejects expert actions** — every loss number becomes meaningless | 3, 5 | `n_expert_actions_rejected_by_mask == 0` as a hard exit; the vocabulary as one asserted constant |
 | 5 | **The shortest-path measurement does not hold corpus-wide** | 3, 5 | Both label sets emitted from one pass; the fallback is macro-with-`MOVE`, never raw actions |
@@ -1446,18 +1622,22 @@ Ordered by probability × how expensive it is to discover late.
 
 ```
 bc/
-  acquire.py            # throwaway downloader; T0-a..d live here            (Chapter 2)
-  sources/replay.py     # Kaggle replay JSON  -> (state, action) stream      (Chapter 2)
+  sources/replay.py     # provided replay JSON -> (state, action) stream     (Chapter 2)
   sources/compiler.py   # compile_day rollouts -> (state, action) stream     (Chapter 2, the insurance seam)
+  acquire.py            # downloader; T0-a..d — ONLY if we ever need more games
   decode.py             # the four assertions; raw AND macro labels          (Chapter 3)
   features.py           # VERBS / ITEMS / MARKET_OPS / QTY_BINS / N_UNIT_SLOTS; the extractor
-  dataset.py            # shard build, splits, manifest hashing              (Chapters 2-3)
+  dataset.py            # shard build, manifest hashing                      (Chapters 2-3)
   model.py              # forward(params, batch) -> logits, a pure function  (Chapter 5)
   train.py                                                                   # (Chapter 5)
   infer_numpy.py        # ~20 lines, only if Chapter 6's timing demands it
   eval.py               # the four rungs                                     (Chapter 6)
-data/replays/{episode_id}.json.gz     # tier 1, kept forever
-data/shards/{split}/*.npz             # tier 2, gitignored
+data/sample_data_training_model/      # THE CORPUS — read-only, never modified
+  {train,val,test}/{episode_id}.json  #   70 / 15 / 15 games
+  manifest.csv                        #   ryo_seat, opponent, rewards, strata
+  split_summary.json
+data/replays/{episode_id}.json.gz     # only if we ever download more
+data/shards/{split}/*.npz             # gitignored; {split} copied from the corpus layout
 tests/test_bc_*.py
 docs/learning.md                      # one page per chapter, your own words
 ```
@@ -1481,33 +1661,41 @@ E21. `tests/test_bc_checkpoint_roundtrip.py` covers it.
 
 ## The first two weeks (evenings plus one weekend)
 
-1. **Evening 1.** T0-a..d — hit `ListEpisodes` / `GetEpisodeReplay`, settle auth and the rate limit.
-   Install `torch` into `.venv`; re-run `make test` and `make verify` and confirm both are green.
-2. **Evening 2.** Throwaway downloader. Pull **10 games from one top player** into `data/replays/`.
-3. **Evening 3.** Slot-variance across those 10 (**E88**). Clock-vs-state test on `boatlee` as the
-   positive control — we already know the answer there, so it validates the harness.
-4. **Weekend, morning.** Clock-vs-state test on the human replays. **Decide the teacher** using the
-   yield ladder. Record as **E86**.
-5. **Weekend, afternoon.** `bc/decode.py` plus the four assertions. Write the verb/item vocabulary
-   as one asserted constant — **before anyone writes a head width.**
-6. **Evenings 4–5.** `bc/features.py`. Compute `frac_segments_shortest_path` corpus-wide and make
-   the macro-vs-raw decision. Record as **E87**.
-7. **Evening 6.** Build the shards. Measure sizes against the 1.5 MB threshold. Materialize the
-   splits. Write the Chapter 1–2 entry in `docs/learning.md`.
+The old version of this list spent three evenings downloading and vetting data. **That work is
+done** — the corpus arrived verified, and the acquisition items are parked in Chapter 2's
+"only if we need more data" section. The list now starts at the decoder.
+
+0. **Already done.** Corpus verified: 100 games, schema-matched, all 1.32.7, all DONE, unique
+   seeds. Teacher chosen (Ryo, all 100 games, all wins). Test A measured and passed (**E88**).
+1. **Evening 1.** Install `torch` into `.venv`; re-run `make test` and `make verify` and confirm
+   both are green. Read `manifest.csv` end to end — opponents, `ryo_seat`, margins, strata.
+2. **Evening 2.** Clock-vs-state test on `boatlee` as the positive control — we already know the
+   answer there, so it validates the harness before we point it at Ryo.
+3. **Weekend, morning.** Clock-vs-state test on Ryo's corpus. Record as **E86**. This is the last
+   program-level stop rule; after it, we build.
+4. **Weekend, afternoon.** `bc/decode.py` plus the four assertions, reading
+   `data/sample_data_training_model/` and cloning `ryo_seat`. Write the verb/item vocabulary as one
+   asserted constant — **before anyone writes a head width.**
+5. **Evenings 3–4.** `bc/features.py`. Compute `frac_segments_shortest_path` corpus-wide on Ryo's
+   seat and make the macro-vs-raw decision. Record as **E87**.
+6. **Evening 5.** Build the shards under the provided split names. Measure sizes against the 1.5 MB
+   threshold. Recompute the majority-class floors on Ryo's seat, both over all steps and over
+   steps ≥ 32.
+7. **Evening 6.** Write the Chapter 1–2 entry in `docs/learning.md`.
 
 ## The experiment registry
 
 `docs/experiments.md` is at **E85** and `docs/decisions.md` at **D21** [MEASURED, verified], so this
 plan starts at E86 and D22. **Every measurement claims its number before it runs.** The numbers are
-a registry, not a schedule — E88 runs before E86.
+a registry, not a schedule — E88 ran before E86.
 
 | E | Chapter | What we measure | What it decides |
 |---|---|---|---|
-| **E86** | 2 | Clock-vs-state: step-number-only model vs state-features-minus-step. `boatlee` first as positive control, then the human replays | Whether any imitable policy exists. **This is the program-level stop rule.** |
-| **E87** | 3 | `frac_segments_shortest_path`, corpus-wide, per shard | Macro action space, or macro-with-`MOVE` |
-| **E88** | 2 | Slot-variance per agent over the 719×13 grid | Per-agent episode caps; teacher choice |
-| **E89** | 5 | Per-head agreement with Wilson intervals against the 16.3% / 19.3% floors | Whether v1 learned anything at all |
-| **E90** | 6 | The step/day/hour ablation | **Stop rule** at under 5 points of drop |
+| **E86** | 2 | Clock-vs-state: step-number-only model vs state-features-minus-step. `boatlee` first as positive control, then Ryo's corpus | Whether an imitable policy exists. **The program-level stop rule. Still to run.** |
+| **E87** | 3 | `frac_segments_shortest_path`, corpus-wide on Ryo's seat, per shard | Macro action space, or macro-with-`MOVE` |
+| **E88** | 2 | **MEASURED — PASSED.** Action-sequence hashes across all 100 games: **zero duplicates**. Pairwise step-by-step comparison of Ryo's games (24 games, 12 disjoint pairs): **74–96% of steps differ, median 96%**; identical steps concentrate at indices **0–31** | Teacher is genuinely reactive; the tape-recorder risk is retired. Also gives us the fixed ~30-step opening, which every offline metric now reports around |
+| **E89** | 5 | Per-head agreement with Wilson intervals against floors **recomputed on Ryo's seat** (not the old 16.3% / 19.3% sample figures), all steps and steps ≥ 32 | Whether v1 learned anything at all |
+| **E90** | 6 | The step/day/hour ablation, **on steps ≥ 32** | **Stop rule** at under 5 points of drop |
 | **E91** | 6 | The handover curve, plus agreement split by where the state came from | The size and the season-phase of the compounding-error gap |
 | **E92** | 6 | Online money vs `DEFAULT_POOL`, ≥80 games, both seats, with `Observer` counters | Whether the offline number carries online |
 | **E93** | 6 | Import cost plus 99th-percentile turn time from one timed `env.run` | numpy vs torch at submission time |
