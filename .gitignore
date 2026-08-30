@@ -48,3 +48,5 @@ replay.html
 sample_observation.json
 duy_explore/
 tu/data/sample_data_training_model
+tu_bc/data/sample_data_training_model
+tu_bc/data/shards
