@@ -1,0 +1,15 @@
+{
+  "schema_version": "ryo-bc-v0",
+  "feature_schema_version": "ryo-features-v0",
+  "seed": 20260824,
+  "corpus_root": "duy_explore/ryo_hasegawa_100_stratified",
+  "module_version": "1.32.7",
+  "training": {
+    "learning_rate": 0.001,
+    "batch_size": 512,
+    "max_epochs": 50,
+    "patience": 5,
+    "weight_cap": 4.0
+  },
+  "bootstrap_resamples": 10000
+}
