@@ -30,11 +30,12 @@ from bc_core.dataset import (
 )
 from bc_core.evaluate import (
     EvaluationError,
+    evaluate_external_predictions,
     evaluate_frozen_run,
     success_gate,
     verify_selection,
 )
-from bc_core.features import logical_shard_identity, write_shard
+from bc_core.features import logical_shard_identity, read_shard, write_shard
 from bc_core.checkpoints import (
     choose_device,
     save_checkpoint,
@@ -274,6 +275,30 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual(report["row_order"]["rows"], 15)
         for name in ("majority_actor", "clock", "state"):
             system = report["test"][name]
+            core = system["core_cloning_metrics"]
+            self.assertEqual(
+                set(core),
+                {
+                    "action_macro_f1",
+                    "actor_days",
+                    "actor_steps",
+                    "actor_trajectories",
+                    "daily_gated_prefix_auc",
+                    "days",
+                    "environment_steps",
+                    "evaluated_step_horizon",
+                    "joint_farm_daily_gated_prefix_auc",
+                    "joint_farm_evaluated_step_horizon",
+                    "joint_farm_step_prefix_auc_at_24",
+                    "joint_farm_step_prefix_survival",
+                    "raw_accuracy",
+                    "requested_step_horizon",
+                    "step_prefix_auc_at_24",
+                    "step_prefix_survival",
+                    "supported_actions",
+                },
+            )
+            self.assertEqual(core["raw_accuracy"], system["top1"])
             self.assertEqual(len(system["per_class"]), len(OPERATIONS))
             self.assertEqual(
                 set(system["slice_reports"]),
@@ -1096,6 +1121,23 @@ class EvaluateTest(unittest.TestCase):
             {"PROCEED TO MULTI-HEAD CLONING", "STOP AND DIAGNOSE V0"},
         )
         self.assertIn("| majority_actor | hand | 15 |", markdown)
+        self.assertIn("Step-prefix AUC@24", markdown)
+        self.assertIn("Daily-gated prefix AUC", markdown)
+        self.assertIn("Action macro-F1", markdown)
+        self.assertIn("Strict joint-farm diagnostics", markdown)
+        for system in ("majority_actor", "clock", "state"):
+            core = report["test"][system]["core_cloning_metrics"]
+            expected = (
+                f"| {system} | {core['step_prefix_auc_at_24']:.6f} | "
+                f"{core['daily_gated_prefix_auc']:.6f} | "
+                f"{core['action_macro_f1']:.6f} | {core['raw_accuracy']:.6f} |"
+            )
+            self.assertIn(expected, markdown)
+            joint_expected = (
+                f"| {system} | {core['joint_farm_step_prefix_auc_at_24']:.6f} | "
+                f"{core['joint_farm_daily_gated_prefix_auc']:.6f} |"
+            )
+            self.assertIn(joint_expected, markdown)
         for family in (
             "actor_type",
             "seat",
@@ -1133,6 +1175,64 @@ class EvaluateTest(unittest.TestCase):
         self.assertTrue((self.run_dir / "REPORT.val.md").is_file())
         self.assertFalse((self.run_dir / "evaluation.test.json").exists())
         self.assertFalse((self.run_dir / "REPORT.md").exists())
+
+    def test_external_predictions_use_authenticated_validation_truth_and_publish_reports(
+        self,
+    ) -> None:
+        # Catches accepting model-supplied labels or producing no shareable result.
+        games = [
+            read_shard(self.data_root / record["shard_path"])
+            for record in sorted(
+                (
+                    row
+                    for row in self.training_audit["shards"]
+                    if row["split"] == "val"
+                ),
+                key=lambda row: row["episode_id"],
+            )
+        ]
+        prediction_path = self.root / "tu-perfect.val.npz"
+        np.savez_compressed(
+            prediction_path,
+            predictions=np.concatenate([game.label for game in games]),
+            game_ids=np.concatenate(
+                [
+                    np.repeat(str(game.metadata["episode_id"]), game.label.shape[0])
+                    for game in games
+                ]
+            ),
+            step_indices=np.concatenate([game.step_index for game in games]),
+            actor_ids=np.concatenate(
+                [
+                    np.rint(game.actor_features[:, 1] * 8.0).astype(np.int64)
+                    for game in games
+                ]
+            ),
+        )
+
+        report, json_path, markdown_path = evaluate_external_predictions(
+            prediction_path,
+            self.run_dir,
+            self.data_root,
+            "tu-perfect",
+        )
+
+        self.assertEqual(report["reference_run_id"], self.run_dir.name)
+        self.assertEqual(
+            report["reference_selection_identity"],
+            self.selection["selection_identity"],
+        )
+        self.assertEqual(report["core_cloning_metrics"]["raw_accuracy"], 1.0)
+        self.assertEqual(
+            report["core_cloning_metrics"]["step_prefix_auc_at_24"], 1.0
+        )
+        self.assertEqual(json_path, self.run_dir / "external-tu-perfect.val.json")
+        self.assertEqual(markdown_path, self.run_dir / "external-tu-perfect.val.md")
+        published = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertEqual(published, report)
+        markdown = markdown_path.read_text(encoding="utf-8")
+        self.assertIn("Actor Step-prefix AUC@24", markdown)
+        self.assertIn("How to read this", markdown)
 
     def test_cli_prints_report_metrics_interval_and_decision(self) -> None:
         # Catches a CLI that evaluates but withholds the required operator summary.

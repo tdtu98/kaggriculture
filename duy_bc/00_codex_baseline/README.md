@@ -56,6 +56,24 @@ Prepared data lives under `data/`; checkpoints and reports live under
 The baseline project does not import the separate root-level `duy_rl/`
 package.
 
+## Core cloning metrics
+
+Evaluation reports rank the three primary systems with metrics that preserve
+temporal cloning behavior:
+
+- **Step-prefix AUC@24** averages perfect rolling prefixes of lengths 1 through
+  24 separately for each actor trajectory.
+- **Daily-gated prefix AUC** gives each farmer or hand credit only until that
+  actor's first disagreement within a day, then resets on the next day.
+- **Action macro-F1** averages F1 over the operation classes represented in the
+  evaluated split.
+
+Raw top-1 accuracy is included as supporting context. The report also retains
+strict `joint_farm_*` diagnostics, where one environment step is correct only
+if the farmer and every active hand all match. Those strict values are useful
+for deployment diagnostics but are not the primary ranking because their
+difficulty grows with the number of hands.
+
 ## Restart and compatibility behavior
 
 `make reproduce` is safe to rerun with identical inputs:
@@ -89,6 +107,12 @@ make train RUN_ID=tu-v0
 make evaluate RUN_ID=tu-v0
 make test
 ```
+
+To evaluate actions from a different model architecture on the authenticated
+validation split, follow [`../BC_EVALUATION_GUIDE.md`](../BC_EVALUATION_GUIDE.md)
+and run `scripts/evaluate_predictions.py`. The prediction archive does not
+contain expert labels; the evaluator owns validation truth and aligns rows by
+game, environment step, and actor slot.
 
 `make train` starts a fresh focused run. For automatic compatible resume and
 the complete frozen test workflow, use `make reproduce`.

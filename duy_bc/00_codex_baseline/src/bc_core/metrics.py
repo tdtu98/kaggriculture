@@ -103,6 +103,187 @@ def classification_report(logits: np.ndarray, labels: np.ndarray) -> dict[str, A
     }
 
 
+def _integer_sequence_metadata(
+    values: np.ndarray, name: str, rows: int
+) -> np.ndarray:
+    array = np.asarray(values)
+    if array.ndim != 1 or array.shape[0] != rows:
+        raise ValueError(f"{name} must have shape ({rows},)")
+    if np.issubdtype(array.dtype, np.bool_) or not np.issubdtype(
+        array.dtype, np.integer
+    ):
+        raise ValueError(f"{name} must have an integer dtype")
+    if np.any(array < 0):
+        raise ValueError(f"{name} must be non-negative")
+    return array.astype(np.int64, copy=False)
+
+
+def _validate_contiguous_trajectories(
+    trajectories: dict[Any, dict[int, bool]], name: str
+) -> None:
+    for identity, by_step in trajectories.items():
+        ordered_steps = sorted(by_step)
+        expected = list(range(ordered_steps[0], ordered_steps[-1] + 1))
+        if ordered_steps != expected:
+            raise ValueError(
+                f"step_indices must be contiguous within {name} {identity!r}"
+            )
+
+
+def _prefix_survival(
+    trajectories: dict[Any, dict[int, bool]], requested_horizon: int
+) -> tuple[float, list[dict[str, int | float]], int]:
+    evaluated_horizon = min(
+        requested_horizon, max(len(by_step) for by_step in trajectories.values())
+    )
+    survival: list[dict[str, int | float]] = []
+    ordered = [
+        np.asarray([by_step[step] for step in sorted(by_step)], dtype=np.bool_)
+        for by_step in trajectories.values()
+    ]
+    for horizon in range(1, evaluated_horizon + 1):
+        windows = 0
+        perfect_windows = 0
+        for correctness in ordered:
+            trajectory_windows = correctness.shape[0] - horizon + 1
+            if trajectory_windows <= 0:
+                continue
+            windows += trajectory_windows
+            errors = np.logical_not(correctness).astype(np.int64, copy=False)
+            cumulative = np.concatenate((np.zeros(1, dtype=np.int64), np.cumsum(errors)))
+            window_errors = cumulative[horizon:] - cumulative[:-horizon]
+            perfect_windows += int(np.count_nonzero(window_errors == 0))
+        survival.append(
+            {
+                "horizon": horizon,
+                "perfect_windows": perfect_windows,
+                "windows": windows,
+                "rate": float(perfect_windows / windows),
+            }
+        )
+    return (
+        float(np.mean([item["rate"] for item in survival])),
+        survival,
+        evaluated_horizon,
+    )
+
+
+def _daily_prefix_scores(
+    trajectories: dict[Any, dict[int, bool]], turns_per_day: int
+) -> list[float]:
+    scores: list[float] = []
+    for by_step in trajectories.values():
+        by_day: dict[int, list[bool]] = {}
+        for step in sorted(by_step):
+            by_day.setdefault(step // turns_per_day, []).append(by_step[step])
+        for correctness in by_day.values():
+            correct_prefix = 0
+            for correct in correctness:
+                if not correct:
+                    break
+                correct_prefix += 1
+            scores.append(correct_prefix / len(correctness))
+    return scores
+
+
+def core_cloning_metrics(
+    logits: np.ndarray,
+    labels: np.ndarray,
+    game_ids: Sequence[str],
+    step_indices: np.ndarray,
+    actor_ids: np.ndarray,
+    *,
+    step_horizon: int = 24,
+    turns_per_day: int = 24,
+) -> dict[str, Any]:
+    """Measure action balance and prefix survival on held-out actor trajectories.
+
+    The primary prefix metrics isolate each actor slot and follow its observed
+    decision opportunities, so one hand's disagreement does not erase correct
+    behavior by the farmer or other hands. Strict joint-farm variants are
+    retained as diagnostics and require every actor at an environment step to
+    match.
+    """
+    scores, targets = _validated_classification_inputs(logits, labels)
+    if isinstance(step_horizon, bool) or not isinstance(step_horizon, int):
+        raise ValueError("step_horizon must be a positive integer")
+    if isinstance(turns_per_day, bool) or not isinstance(turns_per_day, int):
+        raise ValueError("turns_per_day must be a positive integer")
+    if step_horizon <= 0:
+        raise ValueError("step_horizon must be a positive integer")
+    if turns_per_day <= 0:
+        raise ValueError("turns_per_day must be a positive integer")
+
+    if isinstance(game_ids, (str, bytes)):
+        raise ValueError("game_ids must be a sequence of strings")
+    try:
+        games = tuple(game_ids)
+    except TypeError as error:
+        raise ValueError("game_ids must be a sequence of strings") from error
+    if len(games) != scores.shape[0] or any(
+        not isinstance(game, str) or not game for game in games
+    ):
+        raise ValueError(
+            f"game_ids must contain {scores.shape[0]} non-empty strings"
+        )
+    steps = _integer_sequence_metadata(step_indices, "step_indices", scores.shape[0])
+    actors = _integer_sequence_metadata(actor_ids, "actor_ids", scores.shape[0])
+
+    predictions = np.argmax(scores, axis=1)
+    row_correct = predictions == targets
+    actor_trajectories: dict[tuple[str, int], dict[int, bool]] = {}
+    joint_farm_trajectories: dict[str, dict[int, bool]] = {}
+    for game, step, actor, correct in zip(
+        games, steps.tolist(), actors.tolist(), row_correct.tolist()
+    ):
+        actor_steps = actor_trajectories.setdefault((game, actor), {})
+        if step in actor_steps:
+            raise ValueError(
+                f"duplicate actor row game={game!r} actor={actor} step={step}"
+            )
+        actor_steps[step] = bool(correct)
+        joint_steps = joint_farm_trajectories.setdefault(game, {})
+        joint_steps[step] = joint_steps.get(step, True) and bool(correct)
+
+    _validate_contiguous_trajectories(joint_farm_trajectories, "game")
+    actor_auc, actor_survival, actor_horizon = _prefix_survival(
+        actor_trajectories, step_horizon
+    )
+    joint_auc, joint_survival, joint_horizon = _prefix_survival(
+        joint_farm_trajectories, step_horizon
+    )
+    actor_daily = _daily_prefix_scores(actor_trajectories, turns_per_day)
+    joint_daily = _daily_prefix_scores(joint_farm_trajectories, turns_per_day)
+
+    classification = classification_report(scores, targets)
+    observed_f1 = [
+        float(item["f1"])
+        for item in classification["per_class"]
+        if int(item["support"]) > 0
+    ]
+    return {
+        f"step_prefix_auc_at_{step_horizon}": actor_auc,
+        "daily_gated_prefix_auc": float(np.mean(actor_daily)),
+        "action_macro_f1": float(np.mean(observed_f1)),
+        "raw_accuracy": float(classification["top1"]),
+        "step_prefix_survival": actor_survival,
+        "requested_step_horizon": step_horizon,
+        "evaluated_step_horizon": actor_horizon,
+        "actor_steps": int(scores.shape[0]),
+        "actor_trajectories": len(actor_trajectories),
+        "actor_days": len(actor_daily),
+        f"joint_farm_step_prefix_auc_at_{step_horizon}": joint_auc,
+        "joint_farm_daily_gated_prefix_auc": float(np.mean(joint_daily)),
+        "joint_farm_step_prefix_survival": joint_survival,
+        "joint_farm_evaluated_step_horizon": joint_horizon,
+        "environment_steps": int(
+            sum(len(by_step) for by_step in joint_farm_trajectories.values())
+        ),
+        "days": len(joint_daily),
+        "supported_actions": len(observed_f1),
+    }
+
+
 def slice_reports(
     logits: np.ndarray,
     labels: np.ndarray,

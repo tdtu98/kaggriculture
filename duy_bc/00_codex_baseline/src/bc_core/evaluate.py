@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,7 +25,12 @@ from bc_core.dataset import (
     validate_train_artifacts,
 )
 from bc_core.features import EncodedGame, encode_game, logical_shard_identity, read_shard
-from bc_core.metrics import classification_report, paired_game_bootstrap, slice_reports
+from bc_core.metrics import (
+    classification_report,
+    core_cloning_metrics,
+    paired_game_bootstrap,
+    slice_reports,
+)
 from bc_core.paths import corpus_path
 from bc_core.checkpoints import architecture_metadata, load_checkpoint
 from bc_core.replay import (
@@ -1107,6 +1113,26 @@ def _evaluation_systems(
     if not label_parts:
         raise EvaluationError("evaluation loader produced no rows")
     labels = np.concatenate(label_parts)
+    step_indices = np.concatenate(
+        [game.step_index.astype(np.int64, copy=False) for game in games]
+    )
+    actor_ids = np.concatenate(
+        [
+            np.rint(game.actor_features[:, 1] * 8.0).astype(np.int64)
+            for game in games
+        ]
+    )
+    expected_game_ids = [
+        str(game.metadata["episode_id"])
+        for game in games
+        for _ in range(game.label.shape[0])
+    ]
+    if (
+        game_ids != expected_game_ids
+        or step_indices.shape != labels.shape
+        or actor_ids.shape != labels.shape
+    ):
+        raise EvaluationError("evaluation sequence metadata is not aligned to row order")
     logits = {
         name: np.concatenate(parts).astype(np.float32, copy=False)
         for name, parts in logits_parts.items()
@@ -1116,11 +1142,385 @@ def _evaluation_systems(
     reports = {
         name: {
             **classification_report(values, labels),
+            "core_cloning_metrics": core_cloning_metrics(
+                values, labels, game_ids, step_indices, actor_ids
+            ),
             "slice_reports": slice_reports(values, labels, slices),
         }
         for name, values in logits.items()
     }
     return reports, game_ids, labels, logits
+
+
+def _external_model_name(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or value in {"", ".", ".."}
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", value) is None
+    ):
+        raise EvaluationError(
+            "model name must be 1-64 safe filename characters beginning with a letter or number"
+        )
+    return value
+
+
+def _external_integer_vector(values: Any, name: str, rows: int) -> np.ndarray:
+    array = np.asarray(values)
+    if array.ndim != 1 or array.shape[0] != rows:
+        raise EvaluationError(f"{name} must have shape ({rows},)")
+    if np.issubdtype(array.dtype, np.bool_) or not np.issubdtype(
+        array.dtype, np.integer
+    ):
+        raise EvaluationError(f"{name} must contain integers")
+    return array.astype(np.int64, copy=False)
+
+
+def external_prediction_report(
+    predictions: np.ndarray,
+    prediction_game_ids: Any,
+    prediction_step_indices: np.ndarray,
+    prediction_actor_ids: np.ndarray,
+    games: list[EncodedGame],
+    model_name: str,
+) -> dict[str, Any]:
+    """Score architecture-independent operation predictions on validation games."""
+    name = _external_model_name(model_name)
+    predicted = np.asarray(predictions)
+    if predicted.ndim != 1 or predicted.shape[0] == 0:
+        raise EvaluationError("predictions must be a non-empty one-dimensional array")
+    if np.issubdtype(predicted.dtype, np.bool_) or not np.issubdtype(
+        predicted.dtype, np.integer
+    ):
+        raise EvaluationError("predictions must contain integer operation IDs")
+    predicted = predicted.astype(np.int64, copy=False)
+    if np.any(predicted < 0) or np.any(predicted >= len(OPERATIONS)):
+        raise EvaluationError(
+            f"prediction operation IDs must be in [0, {len(OPERATIONS) - 1}]"
+        )
+
+    rows = int(predicted.shape[0])
+    try:
+        supplied_games = tuple(prediction_game_ids)
+    except TypeError as error:
+        raise EvaluationError("prediction game IDs must be a sequence") from error
+    if len(supplied_games) != rows or any(
+        not isinstance(game_id, str) or not game_id for game_id in supplied_games
+    ):
+        raise EvaluationError(
+            f"prediction game IDs must contain {rows} non-empty strings"
+        )
+    supplied_steps = _external_integer_vector(
+        prediction_step_indices, "prediction step indices", rows
+    )
+    supplied_actors = _external_integer_vector(
+        prediction_actor_ids, "prediction actor IDs", rows
+    )
+    if np.any(supplied_steps < 0) or np.any(supplied_actors < 0):
+        raise EvaluationError("prediction step indices and actor IDs must be non-negative")
+
+    if not isinstance(games, list) or not games:
+        raise EvaluationError("validation games must be a non-empty list")
+    expected_keys: list[tuple[str, int, int]] = []
+    labels_parts: list[np.ndarray] = []
+    canonical_games: list[str] = []
+    canonical_steps: list[int] = []
+    canonical_actors: list[int] = []
+    for game in games:
+        if not isinstance(game, EncodedGame):
+            raise EvaluationError("validation games must contain EncodedGame snapshots")
+        game_id = game.metadata.get("episode_id")
+        if not isinstance(game_id, str) or not game_id:
+            raise EvaluationError("validation game episode_id must be a non-empty string")
+        if game.metadata.get("split") != "val":
+            raise EvaluationError("external predictions may only be evaluated on split='val'")
+        if (
+            game.label.ndim != 1
+            or game.step_index.shape != game.label.shape
+            or game.actor_features.ndim != 2
+            or game.actor_features.shape[0] != game.label.shape[0]
+            or game.actor_features.shape[1] <= 1
+        ):
+            raise EvaluationError("validation game row metadata is malformed")
+        actors = np.rint(game.actor_features[:, 1] * 8.0).astype(np.int64)
+        steps = game.step_index.astype(np.int64, copy=False)
+        for step, actor in zip(steps.tolist(), actors.tolist()):
+            key = (game_id, int(step), int(actor))
+            expected_keys.append(key)
+            canonical_games.append(game_id)
+            canonical_steps.append(int(step))
+            canonical_actors.append(int(actor))
+        labels_parts.append(game.label.astype(np.int64, copy=False))
+
+    if len(expected_keys) != len(set(expected_keys)):
+        raise EvaluationError("authenticated validation rows contain duplicate identities")
+    supplied_keys = [
+        (game_id, int(step), int(actor))
+        for game_id, step, actor in zip(
+            supplied_games, supplied_steps.tolist(), supplied_actors.tolist()
+        )
+    ]
+    if len(supplied_keys) != len(set(supplied_keys)):
+        raise EvaluationError("duplicate prediction row identity")
+    supplied_index = {key: index for index, key in enumerate(supplied_keys)}
+    expected_set = set(expected_keys)
+    supplied_set = set(supplied_keys)
+    if supplied_set != expected_set:
+        raise EvaluationError(
+            "prediction rows do not match validation rows "
+            f"missing={len(expected_set - supplied_set)} extra={len(supplied_set - expected_set)}"
+        )
+
+    ordered_predictions = predicted[
+        np.asarray([supplied_index[key] for key in expected_keys], dtype=np.int64)
+    ]
+    labels = np.concatenate(labels_parts)
+    scores = np.zeros((labels.shape[0], len(OPERATIONS)), dtype=np.float32)
+    scores[np.arange(labels.shape[0]), ordered_predictions] = 1.0
+    classification = classification_report(scores, labels)
+    core = core_cloning_metrics(
+        scores,
+        labels,
+        canonical_games,
+        np.asarray(canonical_steps, dtype=np.int64),
+        np.asarray(canonical_actors, dtype=np.int64),
+    )
+    return {
+        "schema_version": "ryo-external-evaluation-v0",
+        "model_name": name,
+        "split": "val",
+        "operations": list(OPERATIONS),
+        "rows": int(labels.shape[0]),
+        "games": len(games),
+        "core_cloning_metrics": core,
+        "per_action": classification["per_class"],
+        "confusion_matrix": classification["confusion_matrix"],
+    }
+
+
+def load_external_prediction_archive(path: Path) -> dict[str, np.ndarray]:
+    """Load the strict, label-free NPZ contract used by external models."""
+    prediction_path = Path(path)
+    if prediction_path.is_symlink() or not prediction_path.is_file():
+        raise EvaluationError(
+            "prediction archive must be a regular non-symlink file"
+        )
+    required = {"predictions", "game_ids", "step_indices", "actor_ids"}
+    try:
+        with np.load(prediction_path, allow_pickle=False) as archive:
+            if len(archive.files) != len(required) or set(archive.files) != required:
+                raise EvaluationError(
+                    "prediction archive must contain exactly these fields: "
+                    "predictions, game_ids, step_indices, actor_ids"
+                )
+            try:
+                arrays = {name: archive[name].copy() for name in required}
+            except ValueError as error:
+                raise EvaluationError(
+                    "prediction archive arrays must load without pickle"
+                ) from error
+    except EvaluationError:
+        raise
+    except (OSError, ValueError) as error:
+        raise EvaluationError(f"prediction archive is unreadable: {error}") from error
+
+    predictions = arrays["predictions"]
+    if (
+        predictions.ndim != 1
+        or predictions.shape[0] == 0
+        or np.issubdtype(predictions.dtype, np.bool_)
+        or not np.issubdtype(predictions.dtype, np.integer)
+    ):
+        raise EvaluationError(
+            "prediction archive predictions must be a non-empty integer vector"
+        )
+    rows = int(predictions.shape[0])
+    game_ids = arrays["game_ids"]
+    if (
+        game_ids.ndim != 1
+        or game_ids.shape[0] != rows
+        or game_ids.dtype.kind != "U"
+        or np.any(game_ids == "")
+    ):
+        raise EvaluationError(
+            f"prediction archive game_ids must be {rows} non-empty Unicode strings"
+        )
+    for name in ("step_indices", "actor_ids"):
+        values = arrays[name]
+        if (
+            values.ndim != 1
+            or values.shape[0] != rows
+            or np.issubdtype(values.dtype, np.bool_)
+            or not np.issubdtype(values.dtype, np.integer)
+            or np.any(values < 0)
+        ):
+            raise EvaluationError(
+                f"prediction archive {name} must be a non-negative integer vector "
+                f"with shape ({rows},)"
+            )
+    if np.any(predictions < 0) or np.any(predictions >= len(OPERATIONS)):
+        raise EvaluationError(
+            f"prediction operation IDs must be in [0, {len(OPERATIONS) - 1}]"
+        )
+    return arrays
+
+
+def _render_external_prediction_report(report: dict[str, Any]) -> str:
+    core = report["core_cloning_metrics"]
+    lines = [
+        f"# External BC validation — {report['model_name']}",
+        "",
+        f"Reference run: `{report['reference_run_id']}`",
+        "",
+        f"Validation rows: {report['rows']:,} across {report['games']} games.",
+        "",
+        "## Core cloning metrics",
+        "",
+        "| Priority | Metric | Score | Direction |",
+        "|---:|---|---:|---|",
+        f"| 1 | Actor Step-prefix AUC@24 | {core['step_prefix_auc_at_24']:.6f} | Higher is better |",
+        f"| 2 | Actor Daily-gated prefix AUC | {core['daily_gated_prefix_auc']:.6f} | Higher is better |",
+        f"| 3 | Action macro-F1 | {core['action_macro_f1']:.6f} | Higher is better |",
+        f"| Context | Raw accuracy | {core['raw_accuracy']:.6f} | Higher is better |",
+        "",
+        "## Strict joint-farm diagnostics",
+        "",
+        "| Metric | Score |",
+        "|---|---:|",
+        f"| Joint-farm Step-prefix AUC@24 | {core['joint_farm_step_prefix_auc_at_24']:.6f} |",
+        f"| Joint-farm Daily-gated prefix AUC | {core['joint_farm_daily_gated_prefix_auc']:.6f} |",
+        "",
+        "## How to read this",
+        "",
+        "Start with Actor Step-prefix AUC@24: it rewards uninterrupted local "
+        "behavior chains while allowing recovery in later rolling windows. Then "
+        "check Actor Daily-gated prefix AUC to see how far each actor follows the "
+        "expert within a day before its first disagreement. Use Action macro-F1 "
+        "to confirm that rare behaviors are not hidden by frequent movement actions.",
+        "",
+        "The joint-farm scores are intentionally stricter: one wrong active actor "
+        "makes the whole environment step wrong. Keep them as deployment "
+        "diagnostics, not the primary ranking.",
+        "",
+        "## Per-action behavior",
+        "",
+        "| Action | Precision | Recall | F1 | Support |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for item in report["per_action"]:
+        lines.append(
+            f"| {item['operation']} | {item['precision']:.6f} | "
+            f"{item['recall']:.6f} | {item['f1']:.6f} | {item['support']} |"
+        )
+    lines.extend(
+        [
+            "",
+            "This is a validation-only report. Do not use frozen test results to "
+            "choose the model or checkpoint.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def evaluate_external_predictions(
+    predictions_path: Path,
+    run_dir: Path,
+    data_root: Path,
+    model_name: str,
+) -> tuple[dict[str, Any], Path, Path]:
+    """Authenticate and score one external model on the frozen validation split."""
+    name = _external_model_name(model_name)
+    run_dir = Path(run_dir)
+    data_root = Path(data_root)
+    prediction_path = Path(predictions_path)
+    selection = verify_selection(run_dir)
+    selected_data_root = Path(selection["training_audit"]["path"]).parent
+    if (
+        data_root.is_symlink()
+        or not data_root.is_dir()
+        or data_root.resolve() != selected_data_root.resolve()
+    ):
+        raise EvaluationError(
+            "evaluation data root must equal the frozen training-audit directory"
+        )
+    try:
+        training_audit = validate_training_audit(
+            json.loads(
+                Path(selection["training_audit"]["path"]).read_text(encoding="utf-8")
+            ),
+            selection["config"]["canonical"],
+            require_trainable=True,
+        )
+    except Exception as error:
+        raise EvaluationError(f"frozen training audit is invalid: {error}") from error
+
+    archive = load_external_prediction_archive(prediction_path)
+    fingerprints = _capture_input_fingerprints(
+        _selection_input_paths(run_dir, selection, training_audit)
+        + [prediction_path]
+    )
+    val_sources = _safe_split_sources(training_audit, selection, "val")
+    _, shard_identities, games = _verified_split_shards(
+        training_audit,
+        data_root,
+        "val",
+        sources=val_sources,
+        expected_module_version=str(selection["config"]["canonical"]["module_version"]),
+        capture_snapshots=True,
+    )
+    report = external_prediction_report(
+        archive["predictions"],
+        archive["game_ids"].tolist(),
+        archive["step_indices"],
+        archive["actor_ids"],
+        games,
+        name,
+    )
+    report.update(
+        {
+            "reference_run_id": run_dir.name,
+            "reference_selection_identity": selection["selection_identity"],
+            "predictions": {
+                "path": str(prediction_path.resolve()),
+                "sha256": fingerprints[str(prediction_path)],
+            },
+            "validation_shards": shard_identities,
+            "decision": "VALIDATION ONLY — NO FROZEN TEST DECISION",
+        }
+    )
+    json_path = run_dir / f"external-{name}.val.json"
+    markdown_path = run_dir / f"external-{name}.val.md"
+    outputs = {
+        json_path: _canonical_json_bytes(report, document=True),
+        markdown_path: _render_external_prediction_report(report).encode("utf-8"),
+    }
+    _revalidate_before_publication(
+        run_dir=run_dir,
+        data_root=data_root,
+        split="val",
+        selection=selection,
+        training_audit=training_audit,
+        full_audit=None,
+        shard_identities=shard_identities,
+        fingerprints=fingerprints,
+    )
+    created = _publish_outputs(outputs)
+    try:
+        _revalidate_before_publication(
+            run_dir=run_dir,
+            data_root=data_root,
+            split="val",
+            selection=selection,
+            training_audit=training_audit,
+            full_audit=None,
+            shard_identities=shard_identities,
+            fingerprints=fingerprints,
+        )
+        _assert_output_bytes(outputs)
+    except Exception:
+        _rollback_new_outputs(created)
+        raise
+    return report, json_path, markdown_path
 
 
 def _diagnostics_complete(report: dict[str, dict[str, Any]], rows: int) -> bool:
@@ -1129,6 +1529,24 @@ def _diagnostics_complete(report: dict[str, dict[str, Any]], rows: int) -> bool:
         if not isinstance(system, dict):
             return False
         if set(system.get("slice_reports", {})) != _SLICE_DIMENSIONS:
+            return False
+        core = system.get("core_cloning_metrics")
+        if not isinstance(core, dict):
+            return False
+        for metric in (
+            "step_prefix_auc_at_24",
+            "daily_gated_prefix_auc",
+            "action_macro_f1",
+            "raw_accuracy",
+            "joint_farm_step_prefix_auc_at_24",
+            "joint_farm_daily_gated_prefix_auc",
+        ):
+            value = core.get(metric)
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                return False
+            if not 0.0 <= float(value) <= 1.0:
+                return False
+        if core.get("raw_accuracy") != system.get("top1"):
             return False
         per_class = system.get("per_class")
         confusion = system.get("confusion_matrix")
@@ -1317,10 +1735,46 @@ def _render_test_report(report: dict[str, Any]) -> str:
             f"- Clock: {report['selected_epochs']['clock']}",
             f"- State: {report['selected_epochs']['state']}",
             "",
-            "## Model comparison",
+            "## Core cloning metrics",
             "",
-            "| System | Validation macro-F1 | Test top-1 | Test top-3 | Test macro-F1 |",
+            "| System | Step-prefix AUC@24 | Daily-gated prefix AUC | Action macro-F1 | Raw top-1 |",
             "|---|---:|---:|---:|---:|",
+        ]
+    )
+    for name in _PRIMARY_SYSTEMS:
+        test = report["test"][name]
+        core = test["core_cloning_metrics"]
+        lines.append(
+            f"| {name} | {core['step_prefix_auc_at_24']:.6f} | "
+            f"{core['daily_gated_prefix_auc']:.6f} | "
+            f"{core['action_macro_f1']:.6f} | {core['raw_accuracy']:.6f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "Prefix metrics are calculated per actor trajectory, so one hand's "
+            "mistake does not erase correct behavior by other units. Raw top-1 is "
+            "supporting context, not the primary ranking.",
+            "",
+            "## Strict joint-farm diagnostics",
+            "",
+            "| System | Joint step-prefix AUC@24 | Joint daily-gated prefix AUC |",
+            "|---|---:|---:|",
+        ]
+    )
+    for name in _PRIMARY_SYSTEMS:
+        core = report["test"][name]["core_cloning_metrics"]
+        lines.append(
+            f"| {name} | {core['joint_farm_step_prefix_auc_at_24']:.6f} | "
+            f"{core['joint_farm_daily_gated_prefix_auc']:.6f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Legacy gate diagnostics",
+            "",
+            "| System | Validation fixed-17 macro-F1 | Test top-3 | Test fixed-17 macro-F1 |",
+            "|---|---:|---:|---:|",
         ]
     )
     for name in _PRIMARY_SYSTEMS:
@@ -1331,8 +1785,8 @@ def _render_test_report(report: dict[str, Any]) -> str:
         )
         test = report["test"][name]
         lines.append(
-            f"| {name} | {validation} | {test['top1']:.6f} | "
-            f"{test['top3']:.6f} | {test['macro_f1']:.6f} |"
+            f"| {name} | {validation} | {test['top3']:.6f} | "
+            f"{test['macro_f1']:.6f} |"
         )
     bootstrap = report["bootstrap"]
     lines.extend(
@@ -1388,14 +1842,31 @@ def _render_validation_report(report: dict[str, Any]) -> str:
         "",
         "This artifact is not a frozen test result and carries no go/no-go gate.",
         "",
-        "| System | Top-1 | Top-3 | Macro-F1 |",
-        "|---|---:|---:|---:|",
+        "| System | Step-prefix AUC@24 | Daily-gated prefix AUC | Action macro-F1 | Raw top-1 |",
+        "|---|---:|---:|---:|---:|",
     ]
     for name in _PRIMARY_SYSTEMS:
         metrics = report["validation"][name]
+        core = metrics["core_cloning_metrics"]
         lines.append(
-            f"| {name} | {metrics['top1']:.6f} | {metrics['top3']:.6f} | "
-            f"{metrics['macro_f1']:.6f} |"
+            f"| {name} | {core['step_prefix_auc_at_24']:.6f} | "
+            f"{core['daily_gated_prefix_auc']:.6f} | "
+            f"{core['action_macro_f1']:.6f} | {core['raw_accuracy']:.6f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Strict joint-farm diagnostics",
+            "",
+            "| System | Joint step-prefix AUC@24 | Joint daily-gated prefix AUC |",
+            "|---|---:|---:|",
+        ]
+    )
+    for name in _PRIMARY_SYSTEMS:
+        core = report["validation"][name]["core_cloning_metrics"]
+        lines.append(
+            f"| {name} | {core['joint_farm_step_prefix_auc_at_24']:.6f} | "
+            f"{core['joint_farm_daily_gated_prefix_auc']:.6f} |"
         )
     lines.extend(
         [

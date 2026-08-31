@@ -3,7 +3,12 @@ import unittest
 
 import numpy as np
 
-from bc_core.metrics import classification_report, paired_game_bootstrap, slice_reports
+from bc_core.metrics import (
+    classification_report,
+    core_cloning_metrics,
+    paired_game_bootstrap,
+    slice_reports,
+)
 
 
 def _logits_for(labels: np.ndarray, predictions: np.ndarray) -> np.ndarray:
@@ -16,6 +21,133 @@ def _logits_for(labels: np.ndarray, predictions: np.ndarray) -> np.ndarray:
 
 
 class MetricsTest(unittest.TestCase):
+    def test_core_cloning_metrics_recovers_after_a_bad_step(self) -> None:
+        # Catches truncating the whole game after the first disagreement.
+        labels = np.zeros(8, dtype=np.int64)
+        predictions = np.asarray([0, 0, 0, 1, 0, 0, 0, 0], dtype=np.int64)
+
+        report = core_cloning_metrics(
+            _logits_for(labels, predictions),
+            labels,
+            ["game-a"] * 8,
+            np.arange(8, dtype=np.int64),
+            np.zeros(8, dtype=np.int64),
+            step_horizon=4,
+            turns_per_day=4,
+        )
+
+        self.assertAlmostEqual(
+            report["step_prefix_auc_at_4"],
+            (7 / 8 + 5 / 7 + 3 / 6 + 1 / 5) / 4,
+        )
+        self.assertEqual(
+            report["step_prefix_survival"],
+            [
+                {"horizon": 1, "perfect_windows": 7, "windows": 8, "rate": 7 / 8},
+                {"horizon": 2, "perfect_windows": 5, "windows": 7, "rate": 5 / 7},
+                {"horizon": 3, "perfect_windows": 3, "windows": 6, "rate": 3 / 6},
+                {"horizon": 4, "perfect_windows": 1, "windows": 5, "rate": 1 / 5},
+            ],
+        )
+
+    def test_core_cloning_metrics_isolates_actor_gates_and_retains_joint_farm(self) -> None:
+        # Catches one actor's miss erasing other actors from the primary daily metric.
+        labels = np.zeros(10, dtype=np.int64)
+        predictions = np.asarray([0, 0, 0, 0, 1, 0, 0, 0, 0, 0], dtype=np.int64)
+        step_indices = np.asarray([0, 0, 1, 1, 2, 2, 3, 3, 4, 5], dtype=np.int64)
+        actor_ids = np.asarray([0, 1, 0, 1, 0, 1, 0, 1, 0, 0], dtype=np.int64)
+
+        report = core_cloning_metrics(
+            _logits_for(labels, predictions),
+            labels,
+            ["game-a"] * 10,
+            step_indices,
+            actor_ids,
+            step_horizon=4,
+            turns_per_day=4,
+        )
+
+        # Actor 0 earns 2/4 on day 0 and 2/2 on day 1; actor 1 earns 4/4.
+        # The strict joint-farm diagnostic is [T, T, F, T] then [T, T].
+        self.assertAlmostEqual(report["daily_gated_prefix_auc"], 5 / 6)
+        self.assertAlmostEqual(report["joint_farm_daily_gated_prefix_auc"], 0.75)
+        self.assertEqual(report["actor_trajectories"], 2)
+        self.assertEqual(report["actor_days"], 3)
+        self.assertEqual(report["environment_steps"], 6)
+        self.assertEqual(report["days"], 2)
+
+    def test_core_cloning_metrics_macro_f1_uses_observed_actions_only(self) -> None:
+        # Catches diluting action balance with the thirteen unsupported operations.
+        labels = np.asarray([0, 0, 1, 1], dtype=np.int64)
+        predictions = np.asarray([0, 1, 1, 1], dtype=np.int64)
+
+        report = core_cloning_metrics(
+            _logits_for(labels, predictions),
+            labels,
+            ["game-a"] * 4,
+            np.arange(4, dtype=np.int64),
+            np.zeros(4, dtype=np.int64),
+        )
+
+        self.assertAlmostEqual(report["action_macro_f1"], ((2 / 3) + 0.8) / 2)
+        self.assertEqual(report["raw_accuracy"], 0.75)
+        self.assertEqual(report["supported_actions"], 2)
+
+    def test_core_cloning_metrics_allows_inactive_gaps_in_an_actor_slot(self) -> None:
+        # Catches rejecting normal turns where a hand has no observed action row.
+        labels = np.zeros(6, dtype=np.int64)
+        steps = np.asarray([0, 1, 1, 2, 3, 3], dtype=np.int64)
+        actors = np.asarray([0, 0, 1, 0, 0, 1], dtype=np.int64)
+
+        report = core_cloning_metrics(
+            _logits_for(labels, labels),
+            labels,
+            ["game-a"] * 6,
+            steps,
+            actors,
+            step_horizon=3,
+        )
+
+        self.assertEqual(report["step_prefix_auc_at_3"], 1.0)
+        self.assertEqual(report["actor_trajectories"], 2)
+
+    def test_core_cloning_metrics_reports_short_fixture_horizon_transparently(self) -> None:
+        # Catches silently inventing windows when an evaluation game is shorter than 24.
+        labels = np.zeros(3, dtype=np.int64)
+
+        report = core_cloning_metrics(
+            _logits_for(labels, labels),
+            labels,
+            ["game-a"] * 3,
+            np.arange(3, dtype=np.int64),
+            np.zeros(3, dtype=np.int64),
+        )
+
+        self.assertEqual(report["requested_step_horizon"], 24)
+        self.assertEqual(report["evaluated_step_horizon"], 3)
+        self.assertEqual(report["step_prefix_auc_at_24"], 1.0)
+
+    def test_core_cloning_metrics_rejects_misaligned_sequence_metadata(self) -> None:
+        # Catches zip truncation and ambiguous temporal order in sequence metrics.
+        labels = np.zeros(2, dtype=np.int64)
+        logits = _logits_for(labels, labels)
+        invalid = (
+            (["game-a"], np.asarray([0, 1]), np.asarray([0, 0])),
+            (["game-a", "game-a"], np.asarray([0]), np.asarray([0, 0])),
+            (["game-a", "game-a"], np.asarray([0, 1]), np.asarray([0])),
+            (["game-a", 2], np.asarray([0, 1]), np.asarray([0, 0])),
+            (["game-a", "game-a"], np.asarray([0.0, 1.0]), np.asarray([0, 0])),
+            (["game-a", "game-a"], np.asarray([0, 1]), np.asarray([0.0, 0.0])),
+            (["game-a", "game-a"], np.asarray([0, 2]), np.asarray([0, 0])),
+            (["game-a", "game-a"], np.asarray([0, 0]), np.asarray([0, 0])),
+        )
+        for game_ids, steps, actors in invalid:
+            with self.subTest(
+                game_ids=game_ids, steps=steps.tolist(), actors=actors.tolist()
+            ):
+                with self.assertRaises(ValueError):
+                    core_cloning_metrics(logits, labels, game_ids, steps, actors)
+
     def test_classification_report_uses_all_seventeen_classes(self) -> None:
         # Catches deriving the vocabulary from only the classes present in the batch.
         logits = np.full((3, 17), -10.0)
