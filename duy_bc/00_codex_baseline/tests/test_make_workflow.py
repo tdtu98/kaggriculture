@@ -42,6 +42,8 @@ class MakeWorkflowTest(unittest.TestCase):
             "src/bc_core/__pycache__/paths.pyc",
             ".pytest_cache/state",
             "src/duy_bc_baseline.egg-info/PKG-INFO",
+            "docs/superpowers/plans/example-plan.md",
+            "duy_bc/00_codex_baseline/docs/superpowers/plans/example-plan.md",
         ):
             result = subprocess.run(
                 ["git", "check-ignore", "-q", "--no-index", relative],

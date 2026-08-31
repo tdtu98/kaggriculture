@@ -39,6 +39,7 @@ Thumbs.db
 .env.*
 !.env.example
 .superpowers/
+**/docs/superpowers/plans/
 .worktrees/
 *.log
 logs/
